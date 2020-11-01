@@ -1,0 +1,1 @@
+/^--$START SORTABLE/,/^--$END SORTABLE/d

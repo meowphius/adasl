@@ -1,0 +1,1735 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Tree.CTYPEMANAGED is
+
+--$START DYNAMIC
+   procedure Free_Node is new Ada.Unchecked_Deallocation(Node,
+                                                         Node_Ptr);
+--$END DYNAMIC
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+--$START EXPANDABLE
+   procedure Free_Node_Array is
+     new Ada.Unchecked_Deallocation(Node_Array,
+                                    Node_Array_Ptr);
+
+
+   ------------------------------------------------------------------------
+   -- Increase the size of an expandable data container.
+   procedure Increase_Data_Size (O : in out Object'Class) is
+      New_Array : Node_Array_Ptr;
+   begin
+      if (O.Increment = 0) then
+         raise Container_Full;
+      end if;
+      New_Array := new Node_Array(1 .. (O.Data.all'Last
+                                        + Node_Ref(O.Increment)));
+      New_Array(1 .. O.Data.all'Last) := O.Data.all;
+      for I in O.Data.all'Last + 1 .. New_Array.all'Last loop
+         New_Array(I).Up := O.Free_List;
+         O.Free_List := I;
+      end loop;
+      Free_Node_Array(O.Data);
+      O.Data := New_Array;
+   end Increase_Data_Size;
+--$END EXPANDABLE
+
+
+   ------------------------------------------------------------------------
+   -- Allocate a free node for a new item in the tree.
+   procedure Alloc_Node (O    : in out Object'Class;
+                         Item : out REF_VAL) is
+   begin
+--$START DYNAMIC
+      Item := new Node;
+--$END DYNAMIC
+--$START FIXED
+      if (O.Free_List = NULL_REF) then
+         raise Container_Full;
+      end if;
+      Item := O.Free_List;
+      O.Free_List := O.Data(Item).Up;
+      O.Data(Item).Up := Null_Node;
+      O.Data(Item).Left := Null_Node;
+      O.Data(Item).Right := Null_Node;
+      O.Data(Item).Balance := '=';
+--$END FIXED
+--$START EXPANDABLE
+      if (O.Free_List = NULL_REF) then
+         Increase_Data_Size(O);
+      end if;
+      Item := O.Free_List;
+      O.Free_List := O.Data(Item).Up;
+      O.Data(Item).Up := Null_Node;
+      O.Data(Item).Left := Null_Node;
+      O.Data(Item).Right := Null_Node;
+      O.Data(Item).Balance := '=';
+--$END EXPANDABLE
+   end Alloc_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Free a node that is no longer in use.
+   procedure Free_Node (O    : in out Object'Class;
+                        Item : in out REF_VAL) is
+   begin
+--$START DYNAMIC
+      Free_Node(Item);
+--$END DYNAMIC
+--$START FIXED
+      O.Data(Item).Up := O.Free_List;
+      O.Free_List := Item;
+      Item := Null_Node;
+--$END FIXED
+--$START EXPANDABLE
+      O.Data(Item).Up := O.Free_List;
+      O.Free_List := Item;
+      Item := Null_Node;
+--$END EXPANDABLE
+   end Free_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+
+      if (Iter.Pos = NULL_REF) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_No_Pos (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+   end Check_Iterator_No_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Verify that the current node is consistent.  This is designed to be
+   -- called recursively on each child.  Curr is the node to test.
+   -- Max_Depth will return the maximum depth of the tree based at the
+   -- node.  Count is used to count the total number of items in the tree,
+   -- every visited node adds one.  If Balanced is True, then the tree is a
+   -- balanced tree and special checks are required.
+   procedure Verify_Tree_Node (O         : in Object'Class;
+                               Curr      : in REF_VAL;
+                               Max_Depth : out Integer;
+                               Count     : in out Integer;
+                               Balanced  : in Boolean) is
+      Left_Size  : Integer := 0;
+      Right_Size : Integer := 0;
+   begin
+      if (Curr = NULL_REF) then
+         -- We are past the bottom, just return.
+         Max_Depth := 0;
+      else
+         Count := Count + 1;
+
+         -- Verify that the up pointers of my left child point to me and
+         -- that my left child is less than me.  Then verify the left
+         -- child.
+         if (REF(O, Curr).Left /= NULL_REF) then
+            if (REF(O, REF(O, Curr).Left).Up /= Curr) then
+               raise Internal_Tree_Error;
+            end if;
+            if (REF(O, REF(O, Curr).Left).Val >= REF(O, Curr).Val) then
+               raise Internal_Tree_Error;
+            end if;
+            Verify_Tree_Node(O,
+                             REF(O, Curr).Left,
+                             Left_Size,
+                             Count,
+                             Balanced);
+         end if;
+
+         -- Verify that the up pointers of my right child point to me and
+         -- that my right child is greater than me.  Then verify the right
+         -- child.
+         if (REF(O, Curr).Right /= NULL_REF) then
+            if (REF(O, REF(O, Curr).Right).Up /= Curr) then
+               raise Internal_Tree_Error;
+            end if;
+            if (REF(O, REF(O, Curr).Right).Val <= REF(O, Curr).Val) then
+               raise Internal_Tree_Error;
+            end if;
+            Verify_Tree_Node(O,
+                             REF(O, Curr).Right,
+                             Right_Size,
+                             Count,
+                             Balanced);
+         end if;
+
+         if (Balanced) then
+            -- Verify that my balance values are correct with the AVL
+            -- algorithm.  If Balance is '-', then my left tree should be
+            -- one smaller than my right tree.  An '=' balance means my
+            -- subtrees are of equal depth.  A '+' means that my right tree
+            -- should be one smaller than my left tree.  All other values
+            -- mean the tree is not balanced and that is an error.
+            case (Left_Size - Right_Size) is
+               when -1 =>
+                  if (REF(O, Curr).Balance /= '-') then
+                     raise Internal_Tree_Error;
+                  end if;
+
+               when  0 =>
+                  if (REF(O, Curr).Balance /= '=') then
+                     raise Internal_Tree_Error;
+                  end if;
+
+               when +1 =>
+                  if (REF(O, Curr).Balance /= '+') then
+                     raise Internal_Tree_Error;
+                  end if;
+
+               when others =>
+                  raise Internal_Tree_Error;
+            end case;
+         end if;
+
+         -- Return the proper Max_Depth.
+         if (Left_Size > Right_Size) then
+            Max_Depth := Left_Size + 1;
+         else
+            Max_Depth := Right_Size + 1;
+         end if;
+      end if;
+   end Verify_Tree_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the first item in the subtree referenced by Curr by going
+   -- down the left children until we hit the end.
+   procedure Move_To_First (O    : in Object'Class;
+                            Curr : in out REF_VAL;
+                            Done : out Boolean) is
+   begin
+      if (Curr = NULL_REF) then
+         Done := True;
+      else
+         while (REF(O, Curr).Left /= NULL_REF) loop
+            Curr := REF(O, Curr).Left;
+         end loop;
+         Done := False;
+      end if;
+   end Move_To_First;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the last item in the subtree referenced by Curr by going
+   -- down the right children until we hit the end.
+   procedure Move_To_Last (O    : in Object'Class;
+                           Curr : in out REF_VAL;
+                           Done : out Boolean) is
+   begin
+      if (Curr = NULL_REF) then
+         Done := True;
+      else
+         while (REF(O, Curr).Right /= NULL_REF) loop
+            Curr := REF(O, Curr).Right;
+         end loop;
+         Done := False;
+      end if;
+   end Move_To_Last;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the next item in the tree in an in-fix fashion.
+   procedure Move_To_Next (O    : in Object'Class;
+                           Pos  : in out REF_VAL;
+                           Done : out Boolean) is
+      Curr : REF_VAL := Pos;
+   begin
+      -- First we look to the right.  If we have a right node, then move
+      -- there.
+      if (REF(O, Curr).Right /= NULL_REF) then
+         Curr := REF(O, Curr).Right;
+
+         -- Now move all the way down the left tree.
+         Move_To_First(O, Curr, Done);
+         Pos := Curr;
+      else
+         -- No right node, so we move up until we move up a link that we
+         -- came to from the left side of an Node.
+         loop
+            if (REF(O, Curr).Up = NULL_REF) then
+               Done := True;
+               exit;
+            end if;
+            if (Curr = REF(O, REF(O, Curr).Up).Left) then
+               Done := False;
+               Pos := REF(O, Curr).Up;
+               exit;
+            elsif (Curr = REF(O, REF(O, Curr).Up).Right) then
+               Curr := REF(O, Curr).Up;
+            else
+               raise Internal_Tree_Error;
+            end if;
+         end loop;
+      end if;
+   end Move_To_Next;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the next item in the tree in an in-fix fashion.
+   procedure Move_To_Prev (O    : in Object'Class;
+                           Pos  : in out REF_VAL;
+                           Done : out Boolean) is
+      Curr : REF_VAL := Pos;
+   begin
+      -- First we look to the left.  If we have a left node, then move
+      -- there.
+      if (REF(O, Curr).Left /= NULL_REF) then
+         Curr := REF(O, Curr).Left;
+
+         -- Now move all the way down the right tree.
+         Move_To_Last(O, Curr, Done);
+         Pos := Curr;
+      else
+         -- No left node, so we move up until we move up a link that we
+         -- came to from the right side of an Node.
+         loop
+            if (REF(O, Curr).Up = NULL_REF) then
+               Done := True;
+               exit;
+            end if;
+            if (Curr = REF(O, REF(O, Curr).Up).Right) then
+               Done := False;
+               Pos := REF(O, Curr).Up;
+               exit;
+            elsif (Curr = REF(O, REF(O, Curr).Up).Left) then
+               Curr := REF(O, Curr).Up;
+            else
+               raise Internal_Tree_Error;
+            end if;
+         end loop;
+      end if;
+   end Move_To_Prev;
+
+
+   ------------------------------------------------------------------------
+   -- Replace Curr in the tree with Val with respect to Curr's parent.
+   -- For instance, if Curr is the left child of its parent, then set
+   -- Val to be the new left child of its parent.
+   procedure Replace_Up_Down_Link (O    : in out Object'Class;
+                                   Curr : in REF_VAL;
+                                   Val  : in REF_VAL) is
+      Tree_Curr : REF_VAL := Curr;
+   begin
+      if (REF(O, Curr).Up = NULL_REF) then
+         O.Root := Val;
+      elsif (REF(O, REF(O, Curr).Up).Right = Tree_Curr) then
+         REF(O, REF(O, Curr).Up).Right := Val;
+      elsif (REF(O, REF(O, Curr).Up).Left = Tree_Curr) then
+         REF(O, REF(O, Curr).Up).Left := Val;
+      else
+         raise Internal_Tree_Error;
+      end if;
+      REF(O, Val).Up := REF(O, Curr).Up;
+   end Replace_Up_Down_Link;
+
+
+   ------------------------------------------------------------------------
+   -- A left-left reorder from the AVL algorithm.  Read you data
+   -- structures book for information on AVL trees.
+   procedure Reorder_Left_Left (O    : in out Object'Class;
+                                Curr : in REF_VAL;
+                                Left : in REF_VAL) is
+   begin
+      Replace_Up_Down_Link(O, Curr, Left);
+      REF(O, Curr).Up := Left;
+      REF(O, Curr).Left := REF(O, Left).Right;
+      REF(O, Left).Right := Curr;
+      if (REF(O, Curr).Left /= NULL_REF) then
+         REF(O, REF(O, Curr).Left).Up := REF(O, Left).Right;
+      end if;
+   end Reorder_Left_Left;
+
+
+   ------------------------------------------------------------------------
+   -- A right-right reorder from the AVL algorithm.  Read you data
+   -- structures book for information on AVL trees.
+   procedure Reorder_Right_Right (O     : in out Object'Class;
+                                  Curr  : in REF_VAL;
+                                  Right : in REF_VAL) is
+   begin
+      Replace_Up_Down_Link(O, Curr, Right);
+      REF(O, Curr).Up := Right;
+      REF(O, Curr).Right := REF(O, Right).Left;
+      REF(O, Right).Left := Curr;
+      if (REF(O, Curr).Right /= NULL_REF) then
+         REF(O, REF(O, Curr).Right).Up := REF(O, Right).Left;
+      end if;
+   end Reorder_Right_Right;
+
+
+   ------------------------------------------------------------------------
+   -- A right-left reorder from the AVL algorithm.  Read you data
+   -- structures book for information on AVL trees.
+   procedure Reorder_Right_Left (O     : in out Object'Class;
+                                 Curr  : in REF_VAL;
+                                 Right : in REF_VAL;
+                                 Head  : in REF_VAL) is
+   begin
+      Replace_Up_Down_Link(O, Curr, Head);
+      REF(O, Curr).Up := Head;
+      REF(O, Right).Up := REF(O, Curr).Up;
+      REF(O, Right).Left := REF(O, Head).Right;
+      if (REF(O, Right).Left /= NULL_REF) then
+         REF(O, REF(O, Right).Left).Up := Right;
+      end if;
+      REF(O, Head).Right := REF(O, Curr).Right;
+      REF(O, Curr).Right := REF(O, Head).Left;
+      REF(O, Head).Left := Curr;
+      if (REF(O, Curr).Right /= NULL_REF) then
+         REF(O, REF(O, Curr).Right).Up := REF(O, Head).Left;
+      end if;
+   end Reorder_Right_Left;
+
+
+   ------------------------------------------------------------------------
+   -- A left-right reorder from the AVL algorithm.  Read you data
+   -- structures book for information on AVL trees.
+   procedure Reorder_Left_Right (O    : in out Object'Class;
+                                 Curr : in REF_VAL;
+                                 Left : in REF_VAL;
+                                 Head : in REF_VAL) is
+   begin
+      Replace_Up_Down_Link(O, Curr, Head);
+      REF(O, Curr).Up := Head;
+      REF(O, Left).Up := REF(O, Curr).Up;
+      REF(O, Left).Right := REF(O, Head).Left;
+      if (REF(O, Left).Right /= NULL_REF) then
+         REF(O, REF(O, Left).Right).Up := Left;
+      end if;
+      REF(O, Head).Left := REF(O, Curr).Left;
+      REF(O, Curr).Left := REF(O, Head).Right;
+      REF(O, Head).Right := Curr;
+      if (REF(O, Curr).Left /= NULL_REF) then
+         REF(O, REF(O, Curr).Left).Up := REF(O, Head).Right;
+      end if;
+   end Reorder_Left_Right;
+
+
+   ------------------------------------------------------------------------
+   -- Rebalance a balanced tree after a delete.  When an item is deleted
+   -- from the tree, the tree does a reorganization to account for the
+   -- deleted item.  D_Up is generally the parent of the deleted item;
+   -- Last is Left if the deleted item was the left child of D_Up or right
+   -- if it was the right child.  Read your data structures book on AVL
+   -- trees for details on this algorithm.
+   procedure Balance_On_Delete (O    : in out Object'Class;
+                                D_Up : in REF_VAL;
+                                Last : in Last_Direction) is
+      Dir        : Last_Direction := Last;
+      Curr       : REF_VAL := D_Up;
+      Head       : REF_VAL;
+      Right_Node : REF_VAL;
+      Left_Node  : REF_VAL;
+      Up         : REF_VAL;
+   begin
+      while (Dir /= None) loop
+         if (Dir = Left) then
+            case (REF(O, Curr).Balance) is
+               when '-' =>
+                  Right_Node := REF(O, Curr).Right;
+                  case (REF(O, Right_Node).Balance) is
+                     when '-' =>
+                        Reorder_Right_Right(O, Curr, Right_Node);
+                        REF(O, Right_Node).Balance := '=';
+                        REF(O, Curr).Balance := '=';
+                        Curr := Right_Node;
+                        Up := REF(O, Curr).Up;
+
+                     when '=' =>
+                        Reorder_Right_Right(O, Curr, Right_Node);
+                        REF(O, Right_Node).Balance := '+';
+                        REF(O, Curr).Balance := '-';
+                        Curr := Right_Node;
+                        Up := NULL_REF;
+
+                     when '+' =>
+                        Head := REF(O, Right_Node).Left;
+                        Reorder_Right_Left(O, Curr, Right_Node, Head);
+                        case (REF(O, Head).Balance) is
+                           when '+' =>
+                              REF(O, Curr).Balance := '=';
+                              REF(O, Right_Node).Balance := '-';
+
+                           when '=' =>
+                              REF(O, Curr).Balance := '=';
+                              REF(O, Right_Node).Balance := '=';
+
+                           when '-' =>
+                              REF(O, Curr).Balance := '+';
+                              REF(O, Right_Node).Balance := '=';
+                        end case;
+                        REF(O, Head).Balance := '=';
+                        Curr := Head;
+                        Up := REF(O, Curr).Up;
+                  end case;
+
+               when '=' =>
+                  REF(O, Curr).Balance := '-';
+                  Up := NULL_REF;
+
+               when '+' =>
+                  REF(O, Curr).Balance := '=';
+                  Up := REF(O, Curr).Up;
+            end case;
+         else
+            case (REF(O, Curr).Balance) is
+               when '-' =>
+                  REF(O, Curr).Balance := '=';
+                  Up := REF(O, Curr).Up;
+
+               when '=' =>
+                  REF(O, Curr).Balance := '+';
+                  Up := NULL_REF;
+
+               when '+' =>
+                  Left_Node := REF(O, Curr).Left;
+                  case (REF(O, Left_Node).Balance) is
+                     when '+' =>
+                        Reorder_Left_Left(O, Curr, Left_Node);
+                        REF(O, Left_Node).Balance := '=';
+                        REF(O, Curr).Balance := '=';
+                        Curr := Left_Node;
+                        Up := REF(O, Curr).Up;
+
+                     when '=' =>
+                        Reorder_Left_Left(O, Curr, Left_Node);
+                        REF(O, Left_Node).Balance := '-';
+                        REF(O, Curr).Balance := '+';
+                        Curr := Left_Node;
+                        Up := NULL_REF;
+
+                     when '-' =>
+                        Head := REF(O, Left_Node).Right;
+                        Reorder_Left_Right(O, Curr, Left_Node, Head);
+                        case (REF(O, Head).Balance) is
+                           when '-' =>
+                              REF(O, Curr).Balance := '=';
+                              REF(O, Left_Node).Balance := '+';
+
+                           when '=' =>
+                              REF(O, Curr).Balance := '=';
+                              REF(O, Left_Node).Balance := '=';
+
+                           when '+' =>
+                              REF(O, Curr).Balance := '-';
+                              REF(O, Left_Node).Balance := '=';
+                        end case;
+                        REF(O, Head).Balance := '=';
+                        Curr := Head;
+                        Up := REF(O, Curr).Up;
+                  end case;
+            end case;
+         end if;
+
+         if (Up = NULL_REF) then
+            Dir := None;
+         elsif (REF(O, Up).Right = Curr) then
+            Dir := Right;
+            Curr := Up;
+         elsif (REF(O, Up).Left = Curr) then
+            Dir := Left;
+            Curr := Up;
+         else
+            raise Internal_Tree_Error;
+         end if;
+      end loop;
+   end Balance_On_Delete;
+
+
+   ------------------------------------------------------------------------
+   -- Rebalance a balanced tree after an insertion.  Insertions alway
+   -- happen at leafs, so they are a little easier to handle than
+   -- deletions.  Read your data structures book on AVL trees for details
+   -- on this algorithm.
+   procedure Balance_On_Add (O        : in out Object'Class;
+                             New_Node : in REF_VAL) is
+      Curr         : REF_VAL := REF(O, New_Node).Up;
+      Head         : REF_VAL;
+      Right_Node   : REF_VAL;
+      Left_Node    : REF_VAL;
+      Up           : REF_VAL;
+      Last_Dir     : Last_Direction;
+      Old_Last_Dir : Last_Direction := None;
+   begin
+      if (REF(O, Curr).Left = New_Node) then
+         Last_Dir := Left;
+      elsif (REF(O, Curr).Right = New_Node) then
+         Last_Dir := Right;
+      else
+         raise Internal_Tree_Error;
+      end if;
+
+      while (Curr /= NULL_REF) loop
+         if (Last_Dir = Left) then
+            case (REF(O, Curr).Balance) is
+               when '-' =>
+                  REF(O, Curr).Balance := '=';
+                  Up := NULL_REF;
+
+               when '=' =>
+                  REF(O, Curr).Balance := '+';
+                  Up := REF(O, Curr).Up;
+
+               when '+' =>
+                  Left_Node := REF(O, Curr).Left;
+                  if (Old_Last_Dir = Left) then
+                     Reorder_Left_Left(O, Curr, Left_Node);
+                     REF(O, Curr).Balance := '=';
+                     REF(O, Left_Node).Balance := '=';
+                  elsif (Old_Last_Dir = Right) then
+                     Head := REF(O, Left_Node).Right;
+                     Reorder_Left_Right(O, Curr, Left_Node, Head);
+                     if (REF(O, Head).Balance = '-') then
+                        REF(O, Curr).Balance := '=';
+                        REF(O, Left_Node).Balance := '+';
+                        REF(O, Head).Balance := '=';
+                     elsif (REF(O, Head).Balance = '=') then
+                        REF(O, Curr).Balance := '=';
+                        REF(O, Left_Node).Balance := '=';
+                        REF(O, Head).Balance := '=';
+                     elsif (REF(O, Head).Balance = '+') then
+                        REF(O, Curr).Balance := '-';
+                        REF(O, Left_Node).Balance := '=';
+                        REF(O, Head).Balance := '=';
+                     end if;
+                  else
+                     raise Internal_Tree_Error;
+                  end if;
+                  Up := NULL_REF;
+            end case;
+         else
+            case (REF(O, Curr).Balance) is
+               when '+' =>
+                  REF(O, Curr).Balance := '=';
+                  Up := NULL_REF;
+
+               when '=' =>
+                  REF(O, Curr).Balance := '-';
+                  Up := REF(O, Curr).Up;
+
+               when '-' =>
+                  Right_Node := REF(O, Curr).Right;
+                  if (Old_Last_Dir = Right) then
+                     Reorder_Right_Right(O, Curr, Right_Node);
+                     REF(O, Curr).Balance := '=';
+                     REF(O, Right_Node).Balance := '=';
+                  elsif (Old_Last_Dir = Left) then
+                     Head := REF(O, Right_Node).Left;
+                     Reorder_Right_Left(O, Curr, Right_Node, Head);
+                     if (REF(O, Head).Balance = '+') then
+                        REF(O, Curr).Balance := '=';
+                        REF(O, Right_Node).Balance := '-';
+                        REF(O, Head).Balance := '=';
+                     elsif (REF(O, Head).Balance = '=') then
+                        REF(O, Curr).Balance := '=';
+                        REF(O, Right_Node).Balance := '=';
+                        REF(O, Head).Balance := '=';
+                     elsif (REF(O, Head).Balance = '-') then
+                        REF(O, Curr).Balance := '+';
+                        REF(O, Right_Node).Balance := '=';
+                        REF(O, Head).Balance := '=';
+                     end if;
+                  else
+                     raise Internal_Tree_Error;
+                  end if;
+                  Up := NULL_REF;
+            end case;
+         end if;
+
+         Old_Last_Dir := Last_Dir;
+         if (Up = NULL_REF) then
+            Last_Dir := None;
+            Curr := NULL_REF;
+         elsif (REF(O, Up).Right = Curr) then
+            Last_Dir := Right;
+            Curr := Up;
+         elsif (REF(O, Up).Left = Curr) then
+            Last_Dir := Left;
+            Curr := Up;
+         else
+            raise Internal_Tree_Error;
+         end if;
+      end loop;
+   end Balance_On_Add;
+
+
+   ------------------------------------------------------------------------
+   -- Delete the item Curr from the tree.  If Last = Left, then curr is
+   -- the left child of its parent.  If Last = Right, the it is the right
+   -- child of its parent.  If Last = None, then Curr is the root of the
+   -- tree.
+   procedure Delete_Item (O    : in out Object'Class;
+                          Curr : in out REF_VAL;
+                          Last : in Last_Direction) is
+      Swap       : REF_VAL;
+      Delete_Dir : Last_Direction;
+      Deleted_Up : REF_VAL;
+   begin
+      O.Update := O.Update + 1;
+
+      if ((REF(O, Curr).Left = NULL_REF)
+          and (REF(O, Curr).Right = NULL_REF))
+      then
+         -- Delete a leaf node, which is pretty easy.
+         case Last is
+            when None  =>
+               O.Root := NULL_REF;
+               Delete_Dir := None;
+
+            when Left  =>
+               REF(O, REF(O, Curr).Up).Left := NULL_REF;
+               Delete_Dir := Left;
+
+            when Right =>
+               REF(O, REF(O, Curr).Up).Right := NULL_REF;
+               Delete_Dir := Right;
+         end case;
+         Deleted_Up := REF(O, Curr).Up;
+      elsif (REF(O, Curr).Left = NULL_REF) then
+         -- Easy case, only a right tree.  Just pull the right tree up.
+         case Last is
+            when None  =>
+               O.Root := REF(O, Curr).Right;
+               Delete_Dir := None;
+
+            when Left  =>
+               REF(O, REF(O, Curr).Up).Left := REF(O, Curr).Right;
+               Delete_Dir := Left;
+
+            when Right =>
+               REF(O, REF(O, Curr).Up).Right := REF(O, Curr).Right;
+               Delete_Dir := Right;
+         end case;
+         REF(O, REF(O, Curr).Right).Up := REF(O, Curr).Up;
+         Deleted_Up := REF(O, Curr).Up;
+      elsif (REF(O, Curr).Right = NULL_REF) then
+         -- Easy case, only a left tree.  Just pull the left tree up.
+         case Last is
+            when None  =>
+               O.Root := REF(O, Curr).Left;
+               Delete_Dir := None;
+
+            when Left  =>
+               REF(O, REF(O, Curr).Up).Left := REF(O, Curr).Left;
+               Delete_Dir := Left;
+
+            when Right =>
+               REF(O, REF(O, Curr).Up).Right := REF(O, Curr).Left;
+               Delete_Dir := Right;
+         end case;
+         REF(O, REF(O, Curr).Left).Up := REF(O, Curr).Up;
+         Deleted_Up := REF(O, Curr).Up;
+      else
+         -- Hard case, both a left and right tree.  We search down
+         -- the leftmost branch of the right subtree of the current
+         -- node.  The current node can be replace with this node.
+         Swap := REF(O, Curr).Right;
+         if (REF(O, Swap).Left = NULL_REF) then
+            -- We have a situation like this:
+            --
+            --                 A
+            --             B       C
+            --           D   E       G
+            --
+            -- Remove "C" (the swap value) from the tree here to end
+            -- up with
+            --
+            --                 A
+            --             B       G
+            --           D   E
+            --
+            -- Later A will be removed and C put in its place.
+
+            REF(O, Curr).Right := REF(O, Swap).Right;
+            if (REF(O, Swap).Right /= NULL_REF) then
+               REF(O, REF(O, Swap).Right).Up := Curr;
+            end if;
+            Delete_Dir := Right;
+            Deleted_Up := Swap;
+         else
+            -- We have a situation like:
+            --
+            --                 A
+            --             B       C
+            --           D   E   F   G
+            --
+            -- We find the leftmost child of "C", which will be the value
+            -- in the tree that will be immediately after "A".  Then we
+            -- remove it from the tree in anticipation of replacing A with
+            -- it.  In the above case, we would remove "F".
+            Swap := REF(O, Swap).Left;
+            while (REF(O, Swap).Left /= NULL_REF) loop
+               Swap := REF(O, Swap).Left;
+            end loop;
+            REF(O, REF(O, Swap).Up).Left := REF(O, Swap).Right;
+
+            if (REF(O, Swap).Right /= NULL_REF) then
+               -- the Swap value had a right child, just make it the left
+               -- child of swap's parent.
+               REF(O, REF(O, Swap).Right).Up := REF(O, Swap).Up;
+            end if;
+            Delete_Dir := Left;
+            Deleted_Up := REF(O, Swap).Up;
+         end if;
+
+         -- Now swap points to the node we will replace the deleted one
+         -- with, so remove the node to delete and replace it with Swap.
+         REF(O, Swap).Right := REF(O, Curr).Right;
+         REF(O, Swap).Left := REF(O, Curr).Left;
+         REF(O, Swap).Up := REF(O, Curr).Up;
+         REF(O, Swap).Balance := REF(O, Curr).Balance;
+         REF(O, REF(O, Curr).Left).Up := Swap;
+         if (REF(O, Curr).Right /= NULL_REF) then
+            REF(O, REF(O, Curr).Right).Up := Swap;
+         end if;
+
+         -- Now fix Swap's new parent to reference it.
+         case Last is
+            when None =>
+               O.Root := Swap;
+
+            when Right =>
+               REF(O, REF(O, Curr).Up).Right := Swap;
+
+            when Left =>
+               REF(O, REF(O, Curr).Up).Left := Swap;
+         end case;
+      end if;
+
+      O.Count := O.Count - 1;
+
+      if (O.Balanced) then
+         Balance_On_Delete(O, Deleted_Up, Delete_Dir);
+      end if;
+
+      if (O.Cb /= null) then
+         Deleted(O.Cb, Asgc.Object(O), REF(O, Curr).Val);
+      end if;
+
+      Free_Node(O, Curr);
+   end Delete_Item;
+
+
+   ------------------------------------------------------------------------
+   -- Search the tree for the given value and return the node that has it.
+   -- This routine will return NULL_REF if the value is not in the
+   -- container.
+   function Local_Search (O   : in Object'Class;
+                          Val : in Contained_Type)
+                          return REF_VAL is
+      Curr : REF_VAL;
+   begin
+      Curr := O.Root;
+      while ((Curr /= NULL_REF)
+             and then (REF(O, Curr).Val /= Val)) loop
+         if (Val > REF(O, Curr).Val) then
+            Curr := REF(O, Curr).Right;
+         else
+            Curr := REF(O, Curr).Left;
+         end if;
+      end loop;
+
+      return Curr;
+   end Local_Search;
+
+
+   ------------------------------------------------------------------------
+   -- Add an item to the container and return a reference to the newly
+   -- added node in Added_Node.
+   procedure Local_Add (O          : in out Object'Class;
+                        Val        : in Contained_Type;
+                        Added_Node : out REF_VAL) is
+      Curr     : REF_VAL := O.Root;
+      New_Node : REF_VAL;
+   begin
+      if (Curr = NULL_REF) then
+         -- Adding to an empty tree is pretty simple.
+         Alloc_Node(O, O.Root);
+         REF(O, O.Root).Val := Val;
+         O.Count := O.Count + 1;
+         if (O.Cb /= null) then
+            Added(O.Cb, Asgc.Object(O), REF(O, O.Root).Val);
+         end if;
+         Added_Node := O.Root;
+      else
+         -- Search for the leaf position to place the node at, then add it
+         -- at that location.
+         loop
+            if (Val > REF(O, Curr).Val) then
+               -- Go down the right subtree.
+
+               if (REF(O, Curr).Right = NULL_REF) then
+                  -- No right subtree, just add it as the right child here.
+                  Alloc_Node(O, New_Node);
+                  REF(O, Curr).Right := New_Node;
+                  REF(O, REF(O, Curr).Right).Up := Curr;
+                  REF(O, REF(O, Curr).Right).Val := Val;
+                  O.Count := O.Count + 1;
+                  Curr := REF(O, Curr).Right;
+                  if (O.Balanced) then
+                     Balance_On_Add(O, Curr);
+                  end if;
+                  if (O.Cb /= null) then
+                     Added(O.Cb, Asgc.Object(O), REF(O, Curr).Val);
+                  end if;
+                  exit;
+               else
+                  -- The right subtree exists, go down it.
+                  Curr := REF(O, Curr).Right;
+               end if;
+            elsif (Val < REF(O, Curr).Val) then
+               -- Go down the left subtree.
+
+               if (REF(O, Curr).Left = NULL_REF) then
+                  -- No left subtree, just add it as the left child here.
+                  Alloc_Node(O, New_Node);
+                  REF(O, Curr).Left := New_Node;
+                  REF(O, REF(O, Curr).Left).Up := Curr;
+                  REF(O, REF(O, Curr).Left).Val := Val;
+                  O.Count := O.Count + 1;
+                  Curr := REF(O, Curr).Left;
+                  if (O.Balanced) then
+                     Balance_On_Add(O, Curr);
+                  end if;
+                  if (O.Cb /= null) then
+                     Added(O.Cb, Asgc.Object(O), REF(O, Curr).Val);
+                  end if;
+                  exit;
+               else
+                  -- The left subtree exists, go down it.
+                  Curr := REF(O, Curr).Left;
+               end if;
+            else
+               -- The item is already in the tree.
+               raise Item_Already_Exists;
+            end if;
+         end loop;
+
+         Added_Node := New_Node;
+      end if;
+
+      O.Update := O.Update + 1;
+   end Local_Add;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+--$START DYNAMIC
+      null;
+--$END DYNAMIC
+--$START FIXED
+      for I in 1 .. O.Size loop
+         O.Data(I).Up := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END FIXED
+--$START EXPANDABLE
+      for I in 1 .. O.Initial_Size loop
+         O.Data(I).Up := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END EXPANDABLE
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+      New_Tree : REF_VAL := NULL_REF;
+      New_Curr : REF_VAL;
+      Old_Curr : REF_VAL := O.Root;
+      Done     : Boolean;
+   begin
+--$START DYNAMIC
+      if (O.Root /= NULL_REF) then
+         New_Tree := new Node;
+         New_Tree.Val := Old_Curr.Val;
+         New_Tree.Balance := Old_Curr.Balance;
+
+         -- Do a prefix, left first traversal of the tree and copy the
+         -- nodes as we visit them.
+         New_Curr := New_Tree;
+         Main_Copy_Loop: loop
+            if (Old_Curr.Left /= NULL_REF) then
+               -- Traverse down the left branch.
+               New_Curr.Left := new Node;
+               New_Curr.Left.Up := New_Curr;
+               New_Curr.Left.Val := Old_Curr.Left.Val;
+               New_Curr.Left.Balance := Old_Curr.Left.Balance;
+               New_Curr := New_Curr.Left;
+               Old_Curr := Old_Curr.Left;
+            elsif (Old_Curr.Right /= NULL_REF) then
+               -- Traverse down the right branch.
+               New_Curr.Right := new Node;
+               New_Curr.Right.Up := New_Curr;
+               New_Curr.Right.Val := Old_Curr.Right.Val;
+               New_Curr.Right.Balance := Old_Curr.Right.Balance;
+               New_Curr := New_Curr.Right;
+               Old_Curr := Old_Curr.Right;
+            else
+               -- At the end of the branch, go up until we traverse from a
+               -- left branch and the right branch is not NULL_REF.
+               loop
+                  if ((Old_Curr.Up.Left = Old_Curr)
+                      and (Old_Curr.Up.Right /= NULL_REF))
+                  then
+                     -- We found the next item, so move to it and create
+                     -- it.
+                     Old_Curr := Old_Curr.Up;
+                     New_Curr := New_Curr.Up;
+                     New_Curr.Right := new Node;
+                     New_Curr.Right.Up := New_Curr;
+                     New_Curr.Right.Val := Old_Curr.Right.Val;
+                     New_Curr.Right.Balance := Old_Curr.Right.Balance;
+                     New_Curr := New_Curr.Right;
+                     Old_Curr := Old_Curr.Right;
+                     exit;
+                  else
+                     New_Curr := New_Curr.Up;
+                     Old_Curr := Old_Curr.Up;
+
+                     if (Old_Curr.Up = NULL_REF) then
+                        if (New_Curr.Up /= NULL_REF) then
+                           raise Internal_Tree_Error;
+                        end if;
+                        exit Main_Copy_Loop;
+                     end if;
+                  end if;
+               end loop;
+            end if;
+         end loop Main_Copy_Loop;
+      end if;
+
+      O.Root := New_Tree;
+--$END DYNAMIC
+--$START EXPANDABLE
+      O.Data := new Node_Array'(O.Data.all);
+--$END EXPANDABLE
+
+      New_Curr := O.Root;
+      if (O.Cb /= null) then
+         Move_To_First(O, New_Curr, Done);
+         while (not Done) loop
+            Copied(O.Cb, O, REF(O, New_Curr).Val);
+            Move_To_Next(O, New_Curr, Done);
+         end loop;
+      end if;
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+      Curr    : REF_VAL := O.Root;
+      Temp    : REF_VAL;
+   begin
+      -- Do a postfix, left first traversal of the tree, deleting nodes as
+      -- we are at them.
+      while (Curr /= NULL_REF) loop
+         if (REF(O, Curr).Left /= NULL_REF) then
+            Temp := Curr;
+            Curr := REF(O, Curr).Left;
+            REF(O, Temp).Left := NULL_REF;
+         elsif (REF(O, Curr).Right /= NULL_REF) then
+            Temp := Curr;
+            Curr := REF(O, Curr).Right;
+            REF(O, Temp).Right := NULL_REF;
+         else
+            Temp := REF(O, Curr).Up;
+            if (O.Cb /= null) then
+               Deleted(O.Cb, O, REF(O, Curr).Val);
+            end if;
+--$START DYNAMIC
+            Free_Node(Curr);
+--$END DYNAMIC
+            Curr := Temp;
+         end if;
+      end loop;
+
+--$START EXPANDABLE
+      Free_Node_Array(O.Data);
+--$END EXPANDABLE
+      O.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      Count : Integer := 0;
+      Depth : Integer;
+   begin
+      Check_Object(O);
+
+      Verify_Tree_Node(O, O.Root, Depth, Count, O.Balanced);
+      if (Count /= O.Count) then
+         raise Internal_Tree_Error;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval : Object_Ptr;
+   begin
+--$START DYNAMIC
+      Retval := new Object(Balanced => O.Balanced);
+--$END DYNAMIC
+--$START FIXED
+      Retval := new Object(Balanced => O.Balanced,
+                           Size     => O.Size);
+--$END FIXED
+--$START EXPANDABLE
+      Retval := new Object(Balanced     => O.Balanced,
+                           initial_Size => O.Initial_Size,
+                           Increment    => O.Increment);
+--$END EXPANDABLE
+      Retval.all := O;
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (O   : in out Object;
+                  Val : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Object(O);
+
+      Local_Add(O, Val, New_Node);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      Last : Last_Direction := None;
+      Curr : REF_VAL := O.Root;
+   begin
+      Check_Object(O);
+
+      -- Find the item to delete.  We can't use Local_Search because we
+      -- need to know if we are the parent's left or right child.
+      while (Curr /= NULL_REF) loop
+         if (Val > REF(O, Curr).Val) then
+            Curr := REF(O, Curr).Right;
+            Last := Right;
+         elsif (Val < REF(O, Curr).Val) then
+            Curr := REF(O, Curr).Left;
+            Last := Left;
+         else
+            -- We found it, now delete it.
+            Delete_Item(O, Curr, Last);
+
+            -- Leaving the routine!
+            return;
+         end if;
+      end loop;
+
+      raise Item_Not_Found;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+   begin
+      Check_Object(O);
+
+      return (Local_Search(O, Val) /= NULL_REF);
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object)
+                          return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+      Curr1 : REF_VAL := O1.Root;
+      Curr2 : REF_VAL := O2.Root;
+      Done1, Done2 : Boolean := False;
+      Retval : Boolean := True;
+
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Count /= O2.Count) then
+         Retval := False;
+      else
+         -- Compare equality by doing an in-fix traversal of both trees and
+         -- verifying that they have exactly the same values at each
+         -- position.  Note that the trees do not have to have exactly the
+         -- same structure, just the same in-fix traversal.  So the
+         -- following two trees would compare as equal.
+         --
+         --                3                   2
+         --             2                    1   3
+         --          1
+
+
+         -- Move to the first node and start traversing.
+         Move_To_First(O1, Curr1, Done1);
+         Move_To_First(O2, Curr2, Done2);
+         if (Done1 /= Done2) then
+            -- The trees have the same number of nodes, so they should hit
+            -- Done at the same time.
+            raise Internal_Tree_Error;
+         end if;
+         while (not Done1) loop
+            if (REF(O1, Curr1).Val /= REF(O2, Curr2).Val) then
+               Retval := False;
+               exit;
+            end if;
+
+            Move_To_Next(O1, Curr1, Done1);
+            Move_To_Next(O2, Curr2, Done2);
+            if (Done1 /= Done2) then
+               -- The trees have the same number of nodes, so they should
+               -- hit Done at the same time.
+               raise Internal_Tree_Error;
+            end if;
+         end loop;
+      end if;
+
+      return Retval;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Add(Iter.Robj.all, Val, Iter.Pos);
+      Iter.Update := Iter.Robj.Update;
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Search (Iter  : in out Iterator;
+                     Val   : in Contained_Type;
+                     Found : out Boolean) is
+      Curr : REF_VAL;
+   begin
+      Check_Iterator(Iter);
+
+      Curr := Local_Search(Iter.Robj.all, Val);
+      if (Curr = NULL_REF) then
+         Found := False;
+      else
+         Iter.Pos := Curr;
+         Found := True;
+      end if;
+   end Search;
+
+
+   ------------------------------------------------------------------------
+   procedure Root (Iter   : in out Iterator;
+                   Is_End : out End_Marker) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Iter.Pos := Iter.Robj.Root;
+      if (Iter.Pos = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Iter.Update := Iter.Robj.Update;
+         Is_End := Not_Past_End;
+      end if;
+   end Root;
+
+
+   ------------------------------------------------------------------------
+   procedure Left (Iter   : in out Iterator;
+                   Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (REF(Iter.Robj, Iter.Pos).Left /= NULL_REF) then
+         Is_End := Not_Past_End;
+         Iter.Pos := REF(Iter.Robj, Iter.Pos).Left;
+      else
+         Is_End := Past_End;
+      end if;
+   end Left;
+
+
+   ------------------------------------------------------------------------
+   procedure Right (Iter   : in out Iterator;
+                    Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (REF(Iter.Robj, Iter.Pos).Right /= NULL_REF) then
+         Is_End := Not_Past_End;
+         Iter.Pos := REF(Iter.Robj, Iter.Pos).Right;
+      else
+         Is_End := Past_End;
+      end if;
+   end Right;
+
+
+   ------------------------------------------------------------------------
+   procedure Up (Iter   : in out Iterator;
+                 Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (REF(Iter.Robj, Iter.Pos).Up /= NULL_REF) then
+         Is_End := Not_Past_End;
+         Iter.Pos := REF(Iter.Robj, Iter.Pos).Up;
+      else
+         Is_End := Past_End;
+      end if;
+   end Up;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := Invalid_Update;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Iter.Pos := Iter.Robj.Root;
+      Move_To_First(Iter.Robj.all, Iter.Pos, Done);
+      Iter.Update := Iter.Robj.Update;
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Last (Iter : in out Iterator; Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Iter.Pos := Iter.Robj.Root;
+      Move_To_Last(Iter.Robj.all, Iter.Pos, Done);
+      Iter.Update := Iter.Robj.Update;
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end Last;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator(Iter);
+
+      Move_To_Next(Iter.Robj.all, Iter.Pos, Done);
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Prev (Iter : in out Iterator; Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator(Iter);
+
+      Move_To_Prev(Iter.Robj.all, Iter.Pos, Done);
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end Prev;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+      New_Pos : REF_VAL;
+      Done    : Boolean;
+      O       : Object_Ptr;
+   begin
+      Check_Iterator(Iter);
+
+      O := Object_Ptr(Iter.Robj);
+      New_Pos := Iter.Pos;
+      Move_To_Next(Iter.Robj.all, New_Pos, Done);
+
+      -- Find out if we are the root, from the left of the node above, or
+      -- to the right of the node above.
+      if (REF(O, Iter.Pos).Up = NULL_REF) then
+         Delete_Item(O.all, Iter.Pos, None);
+      elsif (REF(O.all, REF(O.all, Iter.Pos).Up).Left = Iter.Pos) then
+         Delete_Item(O.all, Iter.Pos, Left);
+      elsif (REF(O.all, REF(O.all, Iter.Pos).Up).Right = Iter.Pos) then
+         Delete_Item(O.all, Iter.Pos, Right);
+      else
+         raise Internal_Tree_Error;
+      end if;
+
+      if (Done) then
+         Is_End := Past_End;
+         Iter.Pos := NULL_REF;
+      else
+         Iter.Update := O.Update;
+         Is_End := Not_Past_End;
+         Iter.Pos := New_Pos;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      return (Iter1.Pos = Iter2.Pos);
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return REF(Iter.Robj, Iter.Pos).Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator(Iter);
+
+      Val := REF(Iter.Robj, Iter.Pos).Val;
+      Move_To_Next(Iter.Robj.all, Iter.Pos, Done);
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Decr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+      Done : Boolean;
+   begin
+      Check_Iterator(Iter);
+
+      Val := REF(Iter.Robj, Iter.Pos).Val;
+      Move_To_Prev(Iter.Robj.all, Iter.Pos, Done);
+      if (Done) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end Get_Decr;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val = REF(Iter2.Robj, Iter2.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val = REF(Iter.Robj, Iter.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function ">" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val > REF(Iter2.Robj, Iter2.Pos).Val);
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function ">" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val > Val);
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function ">" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val > REF(Iter.Robj, Iter.Pos).Val);
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val < REF(Iter2.Robj, Iter2.Pos).Val);
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val < Val);
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val < REF(Iter.Robj, Iter.Pos).Val);
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val
+              >= REF(Iter2.Robj, Iter2.Pos).Val);
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Iter : in Iterator; Val : in Contained_Type)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val >= Val);
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Val : in Contained_Type; Iter : in Iterator)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val >= REF(Iter.Robj, Iter.Pos).Val);
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val
+              <= REF(Iter2.Robj, Iter2.Pos).Val);
+   end "<=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Iter : in Iterator; Val : in Contained_Type)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val <= Val);
+   end "<=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Val : in Contained_Type; Iter : in Iterator)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val <= REF(Iter.Robj, Iter.Pos).Val);
+   end "<=";
+
+end Asgc.Tree.CTYPEMANAGED;

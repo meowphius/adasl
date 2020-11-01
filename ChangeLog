@@ -1,0 +1,168 @@
+2001-11-12  Corey Minyard <minyard@acm.org>
+
+	* asl-date_time-*.ad?: Massive changes to the date and time stuff,
+	adding leap seconds, getting all the timezones working, etc, etc.
+
+	* Makefile: Moved to version 1.4
+
+2001-11-02  Corey Minyard <minyard@acm.org>
+
+	* asgc-ordered-alist.body: Fixed a bug when adding/enqueuing
+	data.
+
+2001-11-01  Corey Minyard <minyard@acm.org>
+	* asl-strings-compare.adb, asl-strings.adb, asl-strings.ads:  Moved
+	the compare routine into the string package.
+	
+	* asl-date_time-calendar.ads, asl-date_time-calendar.adb,
+	asl-date_time-timezone.ads, asl-date_time-timezone.adb,
+	asl-date_time-timezone-simple.ads, asl-date_time-timezone-simple.adb,
+	asl-date_time-register_simple_zones.adb,
+	asl-date_utils.ads, asl-date_utils.adb, asl-timezone.ads,
+	asl-timezone.adb, asl-calendar.ads, asl-calendar.adb,
+	asl-timezone-register_timezones.adb: Completely reworked the
+	date and time stuff to a more sane packaging.
+
+2001-10-31  Corey Minyard <minyard@acm.org>
+
+	* asl-strings-compare.adb: Pulled this function out of another
+	package because it's useful.
+
+	* asl-timezone.adb, asl-timezone-register_timezones.adb: Separated
+	the timezone registration code so it can be auto-generated.
+
+2001-10-28  Corey Minyard <minyard@acm.org>
+
+	* asl-date_utils.ads, asl-date_utils.adb, asl-timezone.ads,
+	asl-timezone.adb, asl-calendar.ads, asl-calendar.adb:
+	Pulled all the general date manipulation routines out of calendar
+	and put them into a new package call date_utils.  This should
+	eliminate the timezone->calendar dependency and speed up the
+	timezone calculations.
+
+2001-10-27  Corey Minyard <minyard@acm.org>
+
+	* asl-timezone.ads, asl-timezone.adb, asl-calendar.ads,
+	asl-calendar.adb, test/test_calendar.adb:
+	Reworked the timezone stuff to a more workable structure.
+
+	* asl-calendar-no_dst_timezone.ads, asl-calendar-no_dst_timezone.adb:
+	Removed these.
+	
+2001-10-26  Corey Minyard <minyard@acm.org>
+
+	* asl-calendar.ads, asl-calendar.adb, asl-calendar-no_dst_timezone.ads,
+	asl-calendar-no_dst_timezone.adb, test/test_calendar.adb:
+	Started working on the calendar package.
+	
+2001-10-24  Corey Minyard <minyard@acm.org>
+
+	* asl-refcount_ptr-managed.adb, asl-refcount_ptr-managed.ads,
+	asl-refcount_string-managed.adb, asl-refcount_string-managed.ads:
+	Added managed types for the refcount pointers.
+
+	* asl-refcount_ptr.ads, asl-refcount_ptr.adb, asl-refcount_string.ads,
+	asl-refcount_string.adb:
+	Changes to make things a little more sane.
+
+	* asp-logging.ads, asp-logging.adb: Started work on a log interface.
+
+	* tests/test_refcount_ptr.adb, test/test_refcount_pack.ads:
+	Added some tests.
+
+2001-10-23  Corey Minyard <minyard@acm.org>
+
+	* asl-refcount_ptr.ads, asl-refcount_ptr.adb, asl-refcount_string.ads,
+	asl-refcount_string.adb:
+	Added a generic reference counting pointer and string type.
+
+2001-10-14  Corey Minyard <minyard@acm.org>
+
+	* asl-telnet-protocol-stream_io.ads, asl-telnet-protocol-stream_io.adb:
+	Reworked the stream mutex to be a protected write instead of a
+	mutex.  This way, it get priority inheritance and everything right.
+	
+	* asl-strings-tokenizer.adb, asl-strings-tokenizer.adb,
+	asl-cmdproc.adb, tests/test_string_tokenizer.adb,
+	examples/telnet_cmdproc_handlers.adb:
+	Made the string tokenizer easier to use.  Unfortunately, it's not
+	backwards compatible.
+	
+2001-09-27  Corey Minyard <minyard@acm.org>
+	
+	* asl-security, asl-security-userpass.ads, asl-security-userpass.adb,
+	asl-cmdproc.adb, examples/telnet_cmdproc_handlers, Makefile:
+	Reworked the security mechanism to make it more flexible.
+
+	* asl-abstract_io.adb, tests/test_abstract_io.adb: Completed the
+	Fixed_IO package, commented out the Decimal_IO package.
+
+	* asl-debug_out.ads, asl-debug_out.adb, asl-cmdproc-telnet.ads,
+	asl-cmdproc-telnet.adb, examples/telnet_cmdproc_handlers.ads,
+	examples/telnet_cmdproc.adb, examples/telnet_cmdproc_handlers.adb,
+	asl-debug_out-command.ads, asl-debug_out-command.adb:
+	Added a debug output package.
+
+	* Makefile: Release the 1.3 version
+	
+2001-09-26  Corey Minyard <minyard@acm.org>
+
+	* asl-cmdproc-telnet.ads, asl-cmdproc-telnet.adb, asl-security,
+	examples/telnet_cmdproc.adb, examples/telnet_cmdproc_handlers.adb
+	examples/telnet_cmdproc_handlers.ads:
+	Added a security callback mechanism.
+
+	* asl-cmdproc-telnet.ads, asl-cmdproc-telnet.adb:
+	Added a convenience package that holds a full listener and
+	telnet command processor.  All you have to do is specify
+	the port and add the commands.
+
+2001-09-25  Corey Minyard <minyard@acm.org>
+
+	* asl-cmdproc.ads, asl-cmdproc.ads, asl-cmdproc-do_help.ads
+	asl-cmdproc-do_help.adb, asl-cmdproc-do_exit.ads,
+	asl-cmdproc-do_exit.adb, examples/telnet_cmdproc.adb:
+	Moved the command processor into here.
+	
+	* asl-abstract_io.ads, asl-abstract_io.adb,
+	asl-abstract_io-telnet.ads, asl-abstract_io-telnet.adb,
+	tests/test_abstract_io.adb, tests/test_abstract_io_handlers.ads,
+	tests/test_abstract_io_handlers.adb:
+	Added the abstract I/O packages.
+	
+	* asl-strings.ads, asl-strings-tokenizer.ads,
+	asl-strings-tokenizer.adb, test/test_string_tokenizer.adb:
+	Added string tokenizer.
+
+	* asl-protocol-telnet.adb, asl-protocol-telnet.ads,
+	asl-protocol-telnet-option-status.adb,
+	asl-protocol-telnet-option-status.ads,
+	asl-protocol-telnet-option-terminal_type.adb,
+	asl-protocol-telnet-option-terminal_type.ads,
+	asl-protocol-telnet-stream_io.adb,
+	asl-protocol-telnet-stream_io.ads,
+	asl-protocol-telnet-option.adb,
+	asl-protocol-telnet-option.ads,
+	asl-protocol-telnet-option-window_size.adb,
+	asl-protocol-telnet-option-window_size.ads,
+	tests/test_telnet.adb,
+	tests/test_telnet_handlers.adb,
+	tests/test_telnet_handlers.ads,
+	examples/telnet_server_handlers.adb,
+	examples/telnet_server_handlers.ads,
+	examples/telnet_server.adb:
+	Added the telnet protocol stuff.
+
+	
+2001-06-12  Corey Minyard <minyard@acm.org>
+
+	* all - Get ready and import into SourceForge.
+
+	* asgc-btree-dynamic.body, asgc-graph.body - Removed some unused
+	variables found by the new version of GNAT.
+
+	* Overview.ltx - Added a reference to AdaSL.
+
+	* Makefile - Added building a distribution.
+
+	* Makefile - Set up the 1.2 release.

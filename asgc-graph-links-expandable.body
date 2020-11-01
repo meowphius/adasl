@@ -1,0 +1,404 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+with Text_IO;
+
+package body Asgc.Graph.Links.ExpandableMANAGED is
+
+   ---------------------------------------------------------------------
+   -- IMPORTANT - Expandable graph links store their positions backward
+   -- in the array, the last element in the array is the first link in
+   -- the set of links.  When a graph node is destroyed, it will delete
+   -- links one at a time from the first link.  Keeping the "first" link
+   -- at the end of the array improves the efficiency of this operation
+   -- substantually.  However, every operation MUST take this into
+   -- account and reverse the order of the position and the array index.
+
+   procedure Free_Edge_Array is new Ada.Unchecked_Deallocation
+     (Edge_Array, Edge_Array_Ptr);
+
+
+   ---------------------------------------------------------------------
+   -- Check that an iterator is valid.  An iterator is not valid if
+   -- it has not been initialized of if the Link container has been
+   -- modified since the last time the iterator's position was set.
+   procedure Check_Iterator (Iter : in Graph_Link_It'Class) is
+   begin
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ---------------------------------------------------------------------
+   -- Check an iterator, but don't require it to have a valid position.
+   -- It still must be initialized properly.
+   procedure Check_Iterator_No_Pos
+     (Iter : in Graph_Link_It'Class) is
+   begin
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator_No_Pos;
+
+
+   ---------------------------------------------------------------------
+   -- The rest of the methods below are are external definitions whose
+   -- functions are defined in the spec file for this package.
+
+
+   ---------------------------------------------------------------------
+   procedure Free_Graph_Link (Node : in out Graph_Link) is
+   begin
+      if (Node.Edges /= null) then
+         Free_Edge_Array(Node.Edges);
+      end if;
+   end Free_Graph_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Copied_Graph_Link (Node : in out Graph_Link) is
+   begin
+      if (Node.Edges /= null) then
+         Node.Edges := new Edge_Array'(Node.Edges.all);
+      end if;
+   end Copied_Graph_Link;
+
+
+   ---------------------------------------------------------------------
+   procedure Set_Node (Iter : in out Graph_Link_It;
+                       Node : in Links.Graph_Link_Class) is
+   begin
+      Iter.Robj := Graph_Link_Class(Node);
+      Iter.Update := Iter.Robj.Update - 1;
+   end Set_Node;
+
+
+   ---------------------------------------------------------------------
+   procedure Add (Node     : in out Graph_Link;
+                  Val      : in Link_Type;
+                  Contents : in Link_Contained_Type) is
+   begin
+      if (Node.Edges = null) then
+         Node.Edges := new Edge_Array(1 .. Initial_Size);
+      elsif (Node.Size = Node.Edges.all'Last) then
+         declare
+            New_Edges : Edge_Array_Ptr
+              := new Edge_Array(1 .. Node.Edges.all'Last + Increment);
+         begin
+            New_Edges.all(1 .. Node.Edges.all'Last) := Node.Edges.all;
+            Free_Edge_Array(Node.Edges);
+            Node.Edges := New_Edges;
+         end;
+      end if;
+
+      Node.Size := Node.Size + 1;
+      Node.Edges(Node.Size).Val := Val;
+      Node.Edges(Node.Size).Contents := Contents;
+      Node.Update := Node.Update + 1;
+   end Add;
+
+
+   ---------------------------------------------------------------------
+   procedure Delete_First (Node : in out Graph_Link) is
+   begin
+      if (Node.Size = 0) then
+         raise Constraint_Error;
+      end if;
+
+      Node.Size := Node.Size - 1;
+      Node.Update := Node.Update + 1;
+   end Delete_First;
+
+
+   ---------------------------------------------------------------------
+   procedure Delete_Val (Node     : in out Graph_Link;
+                         Val      : in Link_Type;
+                         Instance : in Positive := 1) is
+      Count : Positive := 1;
+   begin
+      for I in reverse 1 .. Node.Size loop
+         if (Node.Edges(I).Val = Val) then
+            if (Count = Instance) then
+               for J in I .. (Node.Size - 1) loop
+                  Node.Edges(J) := Node.Edges(J+1);
+               end loop;
+               Node.Size := Node.Size - 1;
+               return;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+      end loop;
+
+      raise Item_Not_Found;
+   end Delete_Val;
+
+
+   ---------------------------------------------------------------------
+   function Get_Pos (Node : in Graph_Link;
+                     Pos  : in Positive)
+                     return Link_Type is
+   begin
+      if (Pos > Node.Size) then
+         raise Constraint_Error;
+      end if;
+
+      return Node.Edges((Node.Size + 1) - Pos).Val;
+   end Get_Pos;
+
+
+   ---------------------------------------------------------------------
+   function Val_Exists (Node     : in Graph_Link;
+                        Val      : in Link_Type;
+                        Instance : in Positive := 1)
+                        return Boolean is
+      Count : Positive := 1;
+   begin
+      for I in reverse 1 .. Node.Size loop
+         if (Node.Edges(I).Val = Val) then
+            if (Count = Instance) then
+               return True;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+      end loop;
+
+      return False;
+   end Val_Exists;
+
+
+   ---------------------------------------------------------------------
+   function Get_Contents (Iter : in Graph_Link_It)
+                          return Link_Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Robj.Edges(Iter.Pos).Contents;
+   end Get_Contents;
+
+
+   ---------------------------------------------------------------------
+   function Get_Contents (Node     : in Graph_Link;
+                          Val      : in Link_Type;
+                          Instance : in Positive := 1)
+                          return Link_Contained_Type is
+      Count : Positive := 1;
+   begin
+      for I in reverse 1 .. Node.Size loop
+         if (Node.Edges(I).Val = Val) then
+            if (Count = Instance) then
+               return Node.Edges(I).Contents;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+      end loop;
+
+      raise Item_Not_Found;
+   end Get_Contents;
+
+
+   ---------------------------------------------------------------------
+   function Get_First_Contents (Node : in Graph_Link)
+                                return Link_Contained_Type is
+   begin
+      return Node.Edges(Node.Size).Contents;
+   end Get_First_Contents;
+
+
+   ---------------------------------------------------------------------
+   procedure Set_Contents (Iter     : in out Graph_Link_It;
+                           Contents : in Link_Contained_Type) is
+   begin
+      Check_Iterator(Iter);
+
+      Iter.Robj.Edges(Iter.Pos).Contents := Contents;
+   end Set_Contents;
+
+
+   ---------------------------------------------------------------------
+   procedure Delete (Iter   : in out Graph_Link_It;
+                     Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      for I in Iter.Pos .. (Iter.Robj.Size - 1) loop
+         Iter.Robj.Edges.all(I) := Iter.Robj.Edges.all(I+1);
+      end loop;
+      Iter.Robj.Size := Iter.Robj.Size - 1;
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      if (Iter.Pos = 1) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Pos := Iter.Pos - 1;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ---------------------------------------------------------------------
+   procedure First (Iter   : in out Graph_Link_It;
+                    Is_End : out End_Marker) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      if (Iter.Robj.Size = 0) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Pos := Iter.Robj.Size;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end First;
+
+
+   ---------------------------------------------------------------------
+   procedure Next (Iter   : in out Graph_Link_It;
+                   Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (Iter.Pos = 1) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Pos := Iter.Pos - 1;
+      end if;
+   end Next;
+
+
+   ---------------------------------------------------------------------
+   procedure Find (Iter     : in out Graph_Link_It;
+                   Val      : in Link_Type;
+                   Found    : out Boolean;
+                   Instance : in Positive := 1) is
+      Count : Positive := 1;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      for I in reverse 1 .. Iter.Robj.Size loop
+         if (Iter.Robj.Edges(I).Val = Val) then
+            if (Count /= Instance) then
+               Count := Count + 1;
+            else
+               Iter.Pos := I;
+               Iter.Update := Iter.Robj.Update;
+               Found := True;
+               return;
+            end if;
+         end if;
+      end loop;
+
+      Found := False;
+   end Find;
+
+
+   ---------------------------------------------------------------------
+   procedure Find_Again (Iter  : in out Graph_Link_It;
+                         Found : out Boolean) is
+      Orig : Positive;
+   begin
+      Check_Iterator(Iter);
+
+      if (Iter.Pos = 1) then
+         Found := False;
+      else
+         Orig := Iter.Pos;
+         for I in reverse 1 .. (Iter.Pos - 1) loop
+            if (Iter.Robj.Edges(I).Val = Iter.Robj.Edges(Orig).Val) then
+               Iter.Pos := I;
+               Found := True;
+               return;
+            end if;
+         end loop;
+
+         Found := False;
+      end if;
+   end Find_Again;
+
+
+   ---------------------------------------------------------------------
+   function Get_Instance_Number (Iter : in Graph_Link_It)
+                                 return Positive is
+      Retval : Positive := 1;
+   begin
+      for I in reverse (Iter.Pos + 1) .. Iter.Robj.Size loop
+         if (Iter.Robj.Edges(I).Val = Iter.Robj.Edges(Iter.Pos).Val) then
+            Retval := Retval + 1;
+         end if;
+      end loop;
+
+      return Retval;
+   end Get_Instance_Number;
+
+
+   ---------------------------------------------------------------------
+   function Get_Instance_Number (Node : in Graph_Link;
+                                 Pos  : in Positive)
+                                 return Positive is
+      Retval   : Positive := 1;
+      Real_Pos : Positive;
+   begin
+      if (Pos > Node.Size) then
+         raise Constraint_Error;
+      end if;
+
+      Real_Pos := (Node.Size + 1) - Pos;
+      for I in reverse (Real_Pos + 1) .. Node.Size loop
+         if (Node.Edges(I).Val = Node.Edges(Real_Pos).Val) then
+            Retval := Retval + 1;
+         end if;
+      end loop;
+
+      return Retval;
+   end Get_Instance_Number;
+
+
+   ---------------------------------------------------------------------
+   function Get (Iter : in Graph_Link_It)
+                 return Link_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Robj.Edges.all(Iter.Pos).Val;
+   end Get;
+
+
+   ---------------------------------------------------------------------
+   function Link_Count (Node : in Graph_Link) return Natural is
+   begin
+      return Node.Size;
+   end Link_Count;
+
+end Asgc.Graph.Links.ExpandableMANAGED;

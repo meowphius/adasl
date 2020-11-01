@@ -1,0 +1,4 @@
+/^--$START DIGRAPH/d
+/^--$END DIGRAPH/d
+/^--$START GRAPH/,/^--$END GRAPH/d
+1,$s/GRAPHTYPE/DiGraph/g

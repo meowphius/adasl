@@ -1,0 +1,162 @@
+*** This is the old (and misnamed) changelog.  Use ChangeLog for new stuff
+
+Release 0.2 - 08/03/1998
+
+* 08/03/1998 - Initial release.
+
+
+Release 0.3 - 08/04/1998
+
+* 08/04/1998 - Removed the discriminant from iterators since the
+  implementation violated the language spec even though GNAT allowed
+  it.  Thanks to Gene Ouye for finding this.
+
+Release 0.4 - 08/13/1998
+
+* 08/05/1998 - Removed the discriminant from the main hash container
+  because it wasn't really necessary.
+
+* 08/07/1998 - Renamed the object-based hierarchy to have an "_O"
+  appended to all the names.  This fixes a namespace problem, it's
+  pretty obvious that saying
+	package Asoc.List is new Asoc.List;
+  is not legal.  Thanks to Gene Ouye for finding this.
+
+* 08/11/1998 - Started working on the graph container.
+
+* 08/11/1998 - Fixed the "=" operator for hash tables so tables with
+  the exact same members will return true, even if the members occur
+  in a different order.
+
+* 08/13/1998 - Finished the graph container.
+
+* 08/13/1998 - Added a directed graph containers.  They were very
+  similar to standard graphs, so using the sed scripts to modify the
+  standard graph container seemed like the easiest way.  I could have
+  made it a discriminant on the graph, but that would have required a
+  discriminant (or wasted store) on every graph node, which didn't
+  excite me very much.
+
+Release 0.5 - 8/16/1998
+
+* 08/14/1998 - Modified the graph containers to support user values on
+  the links.  Also, they will conditionally allow multiple links
+  between the same two nodes.  These were both major oversights in the
+  design of graphs, thanks to Daniel Gaudry for pointing this out.
+
+* 08/14/1998 - Moved all the tests to the tests directory.
+
+* 08/15/1998 - Added an example program that prints minimal paths
+  between states in the United States.  It is in the examples
+  directory.
+
+* 08/15/1998 - Fixed some bugs in the AList container.
+
+Release 0.6 - 08/19/1998
+
+* 08/17/1998 - Modified the graph container to have a separate callback
+  for graph link values.
+
+* 08/17/1998 - Started updating the internal documentation.
+
+* 08/18/1998 - Changed the structure of graphs links to a more reasonable
+  structure and made it more consistent.  This will require code changes
+  for anyone using graphs, but it's not too bad.
+
+* 08/18/1998 - More internal documentation and some restructuring in
+  graphs, hash tables, heaps, ALists, DLists, and trees.
+
+* 08/18/1998 - Removed the object-based graph entries.  They were just
+  too hard to make work and probably not terribly useful.
+
+* 08/19/1998 - Fixed some memory leaks in graph links.
+
+* 08/19/1998 - Modified everything but the Objects and Iterators to not
+  descend from Baseclass.Object.  This decision is based upon efficiency;
+  Baseclass.Object is controlled and thus it has the overhead of the
+  initialization, finalization, etc.  The contained members don't really
+  need that (or if they do, it can be driven from the main object's
+  controlled calls) so this is more efficient in terms of memory and
+  time.  The graph link objects and iterators are also not controlled
+  for the same reason (even though they are objects and iterators).
+
+* 08/19/1998 - Pulled the sort out of Sortable and put it in its own
+  package.  This will (hopefully) allow more flexible sort use.
+
+* 08/19/1998 - Added a quicksort package.
+
+* 08/19/1998 - Added a demo program from Daniel Gaudry and modified it
+  to work with the containers.
+
+Release 0.6a - 08/22/1998
+
+* 08/22/1998 - Created scripts and makefiles to make a krunch-ed
+  version of the packages.  Unfortunately, they were not clean for
+  direct krunching by gnatchop, I had to make a gnat.adc file to
+  translate filenames.
+
+* 08/22/1998 - Baseclass.Limited_Object didn't derive from
+  Limited controlled, that was corrected.
+
+Release 0.7 - 08/27/1998
+
+* 08/23/1998 - Moved the set operations from Asgc to Asgc.Setops,
+  since they didn't really belong in Asgc directly.
+
+* 08/23/1998 - Added a bunch of semaphores.
+
+* 08/25/1998 - Created a set of managed containers, ones that have a storage
+  pool specified for them.  These exactly mimick the regular containers
+  except that they have "_Managed" appended to their name.
+
+* 08/25/1998 - Modified the sed scripts to split out the functionality, so
+  that, for instance, instead of using dynamic-digraph.sed you would use
+  the dynamic.sed hen the digraph.sed.
+
+* 08/25/1998 - Created a special storage pool for detecting memory leaks.
+
+* 08/26/1998 - Added a new Add operation that adds a value to a container
+  using an iterator.  The item is added to the iterator's container and the
+  iterator is positioned on the new item.
+
+* 08/26/1998 - Added two Add_Link routines to the graph container to add
+  links between iterators and values.
+
+* 08/26/1998 - Worked on tests for graphs, they are updated.
+
+* 08/26/1998 - Fixed some leaks in the graph packages.
+
+* 08/27/1998 - Finished up the most of the updates to the tests.  Just a few
+  more small things to do.
+
+* 08/27/1998 - Fixed some bugs the new tests found in the ordered packages.
+
+* 08/27/1998 - Modified the quicksort to speed it up some and to elminate
+  anything but swaps to move data.  This avoids calls to the callbacks
+  since we are not really adding or removing data elements.
+
+* 08/27/1998 - Added some routines to find links between iterators and
+  contained types.
+
+* 08/27/1998 - Finished up the tests and made the makefile run them all
+  automatically.
+
+Release 1.0 - 09/04/1998
+
+* 09/02/1998 - Added a Btree container, full tests, and the like.
+
+* 09/03/1998 - Modified makefiles to make krunching easier.
+
+* 09/03/1998 - Converted documenation to LaTeX, did some updates.
+
+Release 1.1 - 02/12/1999
+
+* 02/12/1999 - Released under new license, it now is under the
+  GPL with the ACT modifications so that it can be used in proprietary
+  programs unemcumbered.
+
+Release 1.x - 
+
+* 06/28/1999 - Fixed a bug in the expandable hash tables that didn't
+  allow adding duplicates.  Thanks to Mikko Ala-Fossi for finding
+  this one.

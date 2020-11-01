@@ -1,0 +1,2392 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Btree.DynamicMANAGED is
+
+   procedure Free_Node is new Ada.Unchecked_Deallocation(Node,
+                                                         Node_Ptr);
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_No_Pos (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+   end Check_Iterator_No_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Return the number of elements in the node.
+   function Node_Count (Node : in Node_Ptr)
+                        return Positive is
+   begin
+      if (Node.First <= Node.Last) then
+         return Node.Last - Node.First + 1;
+      else
+         return (Node.Size - Node.First) + Node.Last + 1;
+      end if;
+   end Node_Count;
+
+
+   ------------------------------------------------------------------------
+   -- Return the item position (ie, the Nth item in the node) of the index.
+   -- The index is assumed to be valid, no check is done.
+   function Node_Item_Pos (Node  : in Node_Ptr;
+                           Index : in Positive)
+                           return Positive is
+   begin
+      if (Node.First <= Index) then
+         return Index - Node.First + 1;
+      else
+         return (Node.Size - Node.First) + Index + 1;
+      end if;
+   end Node_Item_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Return the next value in the node, wrapping around if at the end of
+   -- the array.
+   function Next (Node : in Node_Ptr;
+                  Curr : in Positive)
+                  return Positive is
+   begin
+      if (Curr /= Node.Vals'Last) then
+         return Curr + 1;
+      else
+         return 1;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   -- Return the previous value in the node, wrapping around if at the
+   -- beginning of the array.
+   function Prev (Node : in Node_Ptr;
+                  Curr : in Positive)
+                  return Positive is
+   begin
+      if (Curr /= 1) then
+         return Curr - 1;
+      else
+         return Node.Vals'Last;
+      end if;
+   end Prev;
+
+
+   ------------------------------------------------------------------------
+   -- Return the first value in the Btree.  This is the first value in the
+   -- leftmost node.
+   procedure Local_First (O      : in Object'Class;
+                          Pos    : out Node_Ptr;
+                          Index  : out Positive;
+                          Is_End : out End_Marker) is
+      Retval_Pos : Node_Ptr;
+   begin
+      if (O.Count = 0) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Retval_Pos := O.Root;
+         while (not Retval_Pos.Leaf) loop
+            Retval_Pos := Retval_Pos.Children(Retval_Pos.First);
+         end loop;
+         Pos := Retval_Pos;
+         Index := Retval_Pos.First;
+      end if;
+   end Local_First;
+
+
+   ------------------------------------------------------------------------
+   -- Return the last value in the Btree.  This is the first value in the
+   -- leftmost node.
+   procedure Local_Last (O      : in Object'Class;
+                         Pos    : out Node_Ptr;
+                         Index  : out Positive;
+                         Is_End : out End_Marker) is
+      Retval_Pos : Node_Ptr;
+   begin
+      if (O.Count = 0) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Retval_Pos := O.Root;
+         while (not Retval_Pos.Leaf) loop
+            Retval_Pos := Retval_Pos.Right_Child;
+         end loop;
+         Pos := Retval_Pos;
+         Index := Retval_Pos.Last;
+      end if;
+   end Local_Last;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the next item in the Btree.  This moves the position and
+   -- index to the next item of an in order traversal of the Btree.
+   procedure Local_Next (O      : in Object'Class;
+                         Pos    : in out Node_Ptr;
+                         Index  : in out Positive;
+                         Is_End : out End_Marker) is
+      Tmp_Pos   : Node_Ptr;
+   begin
+      if (Index /= Pos.Last) then
+         -- Not the last item in the current node.
+         if (Pos.Leaf) then
+            -- We just go to the next on leaf nodes.
+            Is_End := Not_Past_End;
+            Index := Next(Pos, Index);
+         else
+            -- Not a leaf, follow the child to my right and then go to the
+            -- leftmost node.
+            Is_End := Not_Past_End;
+            Tmp_Pos := Pos.Children(Next(Pos, Index));
+            while (not Tmp_Pos.Leaf) loop
+               Tmp_Pos := Tmp_Pos.Children(Tmp_Pos.First);
+            end loop;
+            Pos := Tmp_Pos;
+            Index := Pos.First;
+         end if;
+      else
+         if (Pos.Leaf) then
+            -- At the end of a leaf node.  Go back up until we hit the root
+            -- or we hit a node that we are not the right child of.
+            Tmp_Pos := Pos;
+            while ((Tmp_Pos /= O.Root)
+                   and then (Tmp_Pos.Parent_Index = (Tmp_Pos.Parent.Size + 1)))
+            loop
+               Tmp_Pos := Tmp_Pos.Parent;
+            end loop;
+
+            if (Tmp_Pos = O.Root) then
+               Is_End := Past_End;
+            else
+               Is_End := Not_Past_End;
+               Index := Tmp_Pos.Parent_Index;
+               Pos := Tmp_Pos.Parent;
+            end if;
+         else
+            -- Not a leaf not, follow the right child down and then go to
+            -- its left subtree.
+            Is_End := Not_Past_End;
+            Tmp_Pos := Pos.Right_Child;
+            while (not Tmp_Pos.Leaf) loop
+               Tmp_Pos := Tmp_Pos.Children(Tmp_Pos.First);
+            end loop;
+            Pos := Tmp_Pos;
+            Index := Pos.First;
+         end if;
+      end if;
+   end Local_Next;
+
+
+   ------------------------------------------------------------------------
+   -- Move to the previous item in the Btree.  This moves the position and
+   -- index to the previous item of an in order traversal of the Btree.
+   procedure Local_Prev (O      : in Object'Class;
+                         Pos    : in out Node_Ptr;
+                         Index  : in out Positive;
+                         Is_End : out End_Marker) is
+      Tmp_Pos   : Node_Ptr;
+   begin
+      if (Index /= Pos.First) then
+         -- Not the first item in the current node.
+         if (Pos.Leaf) then
+            -- We just go to the previous on leaf nodes.
+            Is_End := Not_Past_End;
+            Index := Prev(Pos, Index);
+         else
+            -- Not a leaf, follow the child to my left and then go to the
+            -- rightmost node.
+            Is_End := Not_Past_End;
+            Tmp_Pos := Pos.Children(Index);
+            while (not Tmp_Pos.Leaf) loop
+               Tmp_Pos := Tmp_Pos.Right_Child;
+            end loop;
+            Pos := Tmp_Pos;
+            Index := Pos.Last;
+         end if;
+      else
+         if (Pos.Leaf) then
+            -- At the end of a leaf node.  Go back up until we hit the root
+            -- or we hit a node that we are not the left child of.
+            Tmp_Pos := Pos;
+            while ((Tmp_Pos /= O.Root)
+                   and then (Tmp_Pos.Parent_Index = Tmp_Pos.Parent.First))
+            loop
+               Tmp_Pos := Tmp_Pos.Parent;
+            end loop;
+
+            if (Tmp_Pos = O.Root) then
+               Is_End := Past_End;
+            else
+               Is_End := Not_Past_End;
+               if (Tmp_Pos.Parent_Index > Tmp_Pos.Parent.Size) then
+                  -- We are a right child, use the rightmost value in the
+                  -- array.
+                  Index := Tmp_Pos.Parent.Last;
+               else
+                  Index := Prev(Tmp_Pos.Parent, Tmp_Pos.Parent_Index);
+               end if;
+               Pos := Tmp_Pos.Parent;
+            end if;
+         else
+            -- Not a leaf not, follow the left child down and then go to
+            -- its right subtree.
+            Is_End := Not_Past_End;
+            Tmp_Pos := Pos.Children(Pos.First);
+            while (not Tmp_Pos.Leaf) loop
+               Tmp_Pos := Tmp_Pos.Right_Child;
+            end loop;
+            Pos := Tmp_Pos;
+            Index := Pos.Last;
+         end if;
+      end if;
+   end Local_Prev;
+
+
+   ------------------------------------------------------------------------
+   -- Search for the given value in the container.  This will return the
+   -- the Pos (a pointer to the node), the Index (the array position in
+   -- the node) and Found, which is True if the value was found and False
+   -- if not.
+   procedure Local_Search (O        : in Object'Class;
+                           Val      : in Contained_Type;
+                           Pos      : out Node_Ptr;
+                           Index    : out Positive;
+                           Found    : out Boolean) is
+      Retval_Pos   : Node_Ptr;
+      Retval_Index : Positive;
+   begin
+      if (O.Count = 0) then
+         Found := False;
+         return;
+      end if;
+
+      Retval_Pos := O.Root;
+      Retval_Index := Retval_Pos.First;
+      while (Retval_Pos.Vals(Retval_Index) /= Val) loop
+         if (Retval_Pos.Vals(Retval_Index) > Val) then
+            -- Not in this node, go down the left subtree of the current
+            -- node.
+            if (Retval_Pos.Leaf) then
+               -- No left subtree, the node is not in the tree.
+               Found := False;
+               return;
+            end if;
+            Retval_Pos := Retval_Pos.Children(Retval_Index);
+            Retval_Index := Retval_Pos.First;
+         elsif (Retval_Index = Retval_Pos.Last) then
+            -- Not in this node, it is to the right.  Follow the rightmost
+            -- subtree.
+            if (Retval_Pos.Leaf) then
+               -- No left subtree, the node is not in the tree.
+               Found := False;
+               return;
+            end if;
+            Retval_Pos := Retval_Pos.Right_Child;
+            Retval_Index := Retval_Pos.First;
+         else
+            -- Keep going in the current node.
+            Retval_Index := Next(Retval_Pos, Retval_Index);
+         end if;
+      end loop;
+
+      Pos := Retval_Pos;
+      Index := Retval_Index;
+      Found := True;
+   end Local_Search;
+
+
+   ------------------------------------------------------------------------
+
+   -- Return the node directly to the left of this node with the same
+   -- parent.  So, for instance if 17 nodes are layed out like:
+   --
+   --                            1
+   --                2        3        4         5
+   --              6 7 8   9 10 11  12 13 14  15 16 17
+   --
+   -- where 2, 3, 4, and 5 are the children of 1 and 6, 7, 8 are the
+   -- children of 2, etc., then left is directly to the left as this
+   -- picture shows.  So 2 is to the left of 3, 9 is to the left of 10,
+   -- etc.  If a node is at the leftmost position (1, 2, 6, 9, 12, and 15
+   -- in this example) then this function will return null for it.
+   function Left_Node (O   : in Object'Class;
+                       Pos : in Node_Ptr)
+                       return Node_Ptr is
+      Retval     : Node_Ptr;
+      Prev_Index : Positive;
+   begin
+      if (Pos.Parent = null) then
+         Retval := null;
+      elsif (Pos.Parent_Index = Pos.Parent.First) then
+         Retval := null;
+      else
+         if (Pos.Parent_Index = (Pos.Parent.Size + 1)) then
+            -- This is a right child.
+            Prev_Index := Pos.Parent.Last;
+         else
+            Prev_Index := Prev(Pos.Parent, Pos.Parent_Index);
+         end if;
+         Retval := Pos.Parent.Children(Prev_Index);
+      end if;
+
+      return Retval;
+   end Left_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Like Left_Node, but returns the node to the right.
+   function Right_Node (O   : in Object'Class;
+                        Pos : in Node_Ptr)
+                        return Node_Ptr is
+      Retval     : Node_Ptr;
+      Next_Index : Positive;
+   begin
+      if (Pos.Parent = null) then
+         Retval := null;
+      elsif (Pos.Parent_Index = (Pos.Parent.Size + 1)) then
+         Retval := null;
+      else
+         if (Pos.Parent_Index = Pos.Parent.Last) then
+            -- Need to pull the right child.
+            Retval := Pos.Parent.Right_Child;
+         else
+            Next_Index := Next(Pos.Parent, Pos.Parent_Index);
+            Retval := Pos.Parent.Children(Next_Index);
+         end if;
+      end if;
+
+      return Retval;
+   end Right_Node;
+
+
+   ------------------------------------------------------------------------
+   -- There is a hole to the left of us that we must move every node one
+   -- over to fill.  So we will make a hole for the new value by removing
+   -- the leftmost node from the passed in node and moving the data over.
+   -- The we wull put the node we pulled out into the common parent with
+   -- the node to the left of us and take the common parent and put it on
+   -- the right side of the node to the left of us by pulling the left
+   -- value out of that node.  We do this till we hit the node that had
+   -- some space, where we past the node we are holding into the rightmost
+   -- place (swapping through the parent, too).  Note that Pos and Index
+   -- are returned with the exact place where the node was inserted.
+   procedure Insert_Shift_Left (O         : in out Object'Class;
+                                Pos       : in out Node_Ptr;
+                                Index     : in out Positive;
+                                Val       : in Contained_Type;
+                                Child     : in Node_Ptr;
+                                Rightmost : in Boolean) is
+      Search_Node  : Node_Ptr;
+      Curr_Node    : Node_Ptr := Pos;
+      Hold_Val     : Contained_Type;
+      Hold_Child   : Node_Ptr;
+      Tmp_Val      : Contained_Type;
+      Tmp_Child    : Node_Ptr;
+      Curr_Index   : Positive;
+      Next_Index   : Positive;
+      Parent_Index : Positive;
+   begin
+      if (Rightmost) then
+         -- The old first node will become the new last node, thus the
+         -- funny insertions here.
+         Hold_Val := Curr_Node.Vals(Curr_Node.First);
+         Curr_Node.Vals(Curr_Node.First) := Val;
+         if (Child /= null) then
+            Hold_Child := Curr_Node.Children(Curr_Node.First);
+
+            -- The right child is still to the right of the inserted node.
+            Curr_Node.Children(Curr_Node.First) := Child;
+            Curr_Node.Children(Curr_Node.First).Parent := Curr_Node;
+            Curr_Node.Children(Curr_Node.First).Parent_Index
+              := Curr_Node.First;
+         end if;
+         Curr_Node.First := Next(Curr_Node, Curr_Node.First);
+         Curr_Node.Last := Next(Curr_Node, Curr_Node.Last);
+         Index := Curr_Node.Last;
+         Search_Node := Left_Node(O, Curr_Node);
+      elsif (Index = Pos.First) then
+         -- The new node is going into the leftmost position, so we will be
+         -- pulling the value out from there.
+         Hold_Val := Val;
+         Hold_Child := Child;
+
+         -- The new node will go in the right of the node to our left.
+         Search_Node := Left_Node(O, Curr_Node);
+         Pos := Search_Node;
+         Index := Next(Search_Node, Search_Node.Last);
+      else
+         -- Move the values over and get the leftmost position into the
+         -- hold value.
+         Hold_Val := Curr_Node.Vals(Curr_Node.First);
+         Curr_Index := Curr_Node.First;
+         Next_Index := Next(Curr_Node, Curr_Index);
+         while (Next_Index /= Index) loop
+            Curr_Node.Vals(Curr_Index) := Curr_Node.Vals(Next_Index);
+            Curr_Index := Next_Index;
+            Next_Index := Next(Curr_Node, Next_Index);
+         end loop;
+         Curr_Node.Vals(Curr_Index) := Val;
+
+         -- We put the new value in one position before the specified
+         -- index, so modify it appropriately.
+         if (Child /= null) then
+            Hold_Child := Curr_Node.Children(Curr_Node.First);
+            Curr_Index := Curr_Node.First;
+            Next_Index := Next(Curr_Node, Curr_Index);
+            while (Next_Index /= Index) loop
+               Curr_Node.Children(Curr_Index)
+                 := Curr_Node.Children(Next_Index);
+               Curr_Node.Children(Curr_Index).Parent_Index := Curr_Index;
+               Curr_Index := Next_Index;
+               Next_Index := Next(Curr_Node, Next_Index);
+            end loop;
+            Curr_Node.Children(Curr_Index) := Child;
+            Curr_Node.Children(Curr_Index).Parent := Curr_Node;
+            Curr_Node.Children(Curr_Index).Parent_Index := Curr_Index;
+         end if;
+         Index := Curr_Index;
+         Search_Node := Left_Node(O, Curr_Node);
+      end if;
+
+      -- Now move stuff over until we can insert it.
+      while (Next(Search_Node, Search_Node.Last) = Search_Node.First) loop
+         -- We want the index whose right child we are.
+         if (Curr_Node.Parent_Index = (Curr_Node.Parent.Size + 1)) then
+            Parent_Index := Curr_Node.Parent.Last;
+         else
+            Parent_Index := Prev(Curr_Node.Parent, Curr_Node.Parent_Index);
+         end if;
+
+         -- Swap the hold value with the value in the parent.
+         Tmp_Val := Curr_Node.Parent.Vals(Parent_Index);
+         Curr_Node.Parent.Vals(Parent_Index) := Hold_Val;
+         -- We don't swap the child because it will go to the right of the
+         -- value just taken from the parent, which is the proper location.
+
+         -- Now put the new hold value into the rightmost value in the node
+         -- and shift everything over.  We just move the circular list over
+         -- by one.
+         -- Note that the current First value will become the new last value.
+         Hold_Val := Search_Node.Vals(Search_Node.First);
+         Search_Node.Vals(Search_Node.First) := Tmp_Val;
+
+         if (Child /= null) then
+            Tmp_Child := Search_Node.Children(Search_Node.First);
+
+            -- Move the right child into the array.
+            Search_Node.Children(Search_Node.First) := Search_Node.Right_Child;
+            Search_Node.Children(Search_Node.First).Parent_Index
+              := Search_Node.First;
+
+            -- Set the new right child.
+            Search_Node.Right_Child := Hold_Child;
+            Search_Node.Right_Child.Parent := Search_Node;
+            Search_Node.Right_Child.Parent_Index
+              := Search_Node.Right_Child.Size + 1;
+
+            Hold_Child := Tmp_Child;
+         end if;
+
+         Search_Node.First := Next(Search_Node, Search_Node.First);
+         Search_Node.Last := Next(Search_Node, Search_Node.Last);
+
+         Curr_Node := Search_Node;
+         Search_Node := Left_Node(O, Search_Node);
+      end loop;
+
+      -- For the final swap, again find the swap parent.
+      while (Curr_Node.Parent_Index = Curr_Node.Parent.First) loop
+         Curr_Node := Curr_Node.Parent;
+      end loop;
+
+      -- We want the index whose right child we are.
+      if (Curr_Node.Parent_Index = (Curr_Node.Parent.Size + 1)) then
+         Parent_Index := Curr_Node.Parent.Last;
+      else
+         Parent_Index := Prev(Curr_Node.Parent, Curr_Node.Parent_Index);
+      end if;
+
+      -- Swap the hold value with the value in the parent.
+      Tmp_Val := Curr_Node.Parent.Vals(Parent_Index);
+      Curr_Node.Parent.Vals(Parent_Index) := Hold_Val;
+
+      -- Now we are at the insertion node, put the hold value into
+      -- the rightmost position.
+      Search_Node.Last := Next(Search_Node, Search_Node.Last);
+      Search_Node.Vals(Search_Node.Last) := Tmp_Val;
+      if (Child /= null) then
+         -- Pull the right child in since we are adding a right node.
+         Search_Node.Children(Search_Node.Last) := Search_Node.Right_Child;
+         Search_Node.Children(Search_Node.Last).Parent_Index
+           := Search_Node.Last;
+
+         -- Now put the new right child in.
+         Search_Node.Right_Child := Hold_Child;
+         Search_Node.Right_Child.Parent_Index := Search_Node.Size + 1;
+         Search_Node.Right_Child.Parent := Search_Node;
+      end if;
+   end Insert_Shift_Left;
+
+
+   ------------------------------------------------------------------------
+   -- There is a hole to the right of us that we must move everything over
+   -- to fill, the opposite of Insert_Shift_Left.
+   procedure Insert_Shift_Right (O         : in out Object'Class;
+                                 Pos       : in out Node_Ptr;
+                                 Index     : in out Positive;
+                                 Rightmost : in Boolean;
+                                 Val       : in Contained_Type;
+                                 Child     : in Node_Ptr) is
+      Search_Node : Node_Ptr;
+      Curr_Node   : Node_Ptr := Pos;
+      Hold_Val    : Contained_Type;
+      Hold_Child  : Node_Ptr;
+      Tmp_Val     : Contained_Type;
+      Tmp_Child   : Node_Ptr;
+      Curr_Index  : Positive;
+      Prev_Index  : Positive;
+   begin
+      -- First we insert the value into the Pos node.
+      if (Rightmost) then
+         -- The new node is going into the rightmost position, so we will be
+         -- pushing it over to the next node.
+         Hold_Val := Val;
+         if (Child /= null) then
+            Hold_Child := Curr_Node.Right_Child;
+            Curr_Node.Right_Child := Child;
+            Curr_Node.Right_Child.Parent := Curr_Node;
+            Curr_Node.Right_Child.Parent_Index := Curr_Node.Size + 1;
+         end if;
+         -- We are moving it over to the other node, so return the right
+         -- position.
+         Search_Node := Right_Node(O, Curr_Node);
+         Pos := Search_Node;
+         Index := Prev(Search_Node, Search_Node.First);
+      else
+         -- Move the values over and get the rightmost position into the
+         -- hold value.
+         Curr_Index := Curr_Node.Last;
+         Hold_Val := Curr_Node.Vals(Curr_Index);
+         while (Curr_Index /= Index) loop
+            Prev_Index := Prev(Curr_Node, Curr_Index);
+            Curr_Node.Vals(Curr_Index) := Curr_Node.Vals(Prev_Index);
+            Curr_Index := Prev_Index;
+         end loop;
+         Curr_Node.Vals(Index) := Val;
+
+         if (Child /= null) then
+            -- Move the children over, too.  The code is a little different
+            -- than the value case because of the special case of the right
+            -- child.
+           Hold_Child := Curr_Node.Right_Child;
+           Curr_Index := Curr_Node.Last;
+           Curr_Node.Right_Child := Curr_Node.Children(Curr_Index);
+           Curr_Node.Right_Child.Parent_Index := Curr_Node.Size + 1;
+           while (Curr_Index /= Index) loop
+              Prev_Index := Prev(Curr_Node, Curr_Index);
+              Curr_Node.Children(Curr_Index) := Curr_Node.Children(Prev_Index);
+              Curr_Node.Children(Curr_Index).Parent_Index := Curr_Index;
+              Curr_Index := Prev_Index;
+           end loop;
+           Curr_Node.Children(Index) := Child;
+           Curr_Node.Children(Index).Parent_Index := Index;
+           Curr_Node.Children(Index).Parent := Curr_Node;
+         end if;
+         Search_Node := Right_Node(O, Curr_Node);
+      end if;
+
+      -- Now move stuff over until we can insert it.
+      while (Next(Search_Node, Search_Node.Last) = Search_Node.First) loop
+         -- Swap the hold value with the value in the parent.
+         Tmp_Val := Curr_Node.Parent.Vals(Curr_Node.Parent_Index);
+         Curr_Node.Parent.Vals(Curr_Node.Parent_Index) := Hold_Val;
+         -- We don't swap the child because it will go to the right of the
+         -- value just taken from the parent, which is the proper location.
+
+         -- Now put the new hold value into the leftmost value in the node
+         -- and shift everything over.  We just move the circular list over
+         -- by one.
+         -- Note that the current last value will be the new first value.
+         Hold_Val := Search_Node.Vals(Search_Node.Last);
+         Search_Node.Vals(Search_Node.Last) := Tmp_Val;
+
+         if (Child /= null) then
+            Tmp_Child := Search_Node.Right_Child;
+            Search_Node.Right_Child := Search_Node.Children(Search_Node.Last);
+            Search_Node.Right_Child.Parent := Search_Node;
+            Search_Node.Right_Child.Parent_Index := Search_Node.Size + 1;
+
+            Search_Node.Children(Search_Node.Last) := Hold_Child;
+            Search_Node.Children(Search_Node.Last).Parent := Search_Node;
+            Search_Node.Children(Search_Node.Last).Parent_Index
+              := Search_Node.Last;
+
+            Hold_Child := Tmp_Child;
+         end if;
+
+         Search_Node.First := Prev(Search_Node, Search_Node.First);
+         Search_Node.Last := Prev(Search_Node, Search_Node.Last);
+
+         Curr_Node := Search_Node;
+         Search_Node := Right_Node(O, Search_Node);
+      end loop;
+
+      -- Once more, find the parent we are going to swap with.
+      while (Curr_Node.Parent_Index = (Curr_Node.Parent.Size + 1)) loop
+         Curr_Node := Curr_Node.Parent;
+      end loop;
+      -- Swap the hold value with the value in the parent.
+      Tmp_Val := Curr_Node.Parent.Vals(Curr_Node.Parent_Index);
+      Curr_Node.Parent.Vals(Curr_Node.Parent_Index) := Hold_Val;
+      Hold_Val := Tmp_Val;
+
+      -- Now we are at the insertion node, put the hold value into
+      -- the leftmost position.
+      Search_Node.First := Prev(Search_Node, Search_Node.First);
+      Search_Node.Vals(Search_Node.First) := Hold_Val;
+      if (Child /= null) then
+         Search_Node.Children(Search_Node.First) := Hold_Child;
+         Search_Node.Children(Search_Node.First).Parent := Search_Node;
+         Search_Node.Children(Search_Node.First).Parent_Index
+           := Search_Node.First;
+      end if;
+   end Insert_Shift_Right;
+
+
+   ------------------------------------------------------------------------
+   -- Split a node into two nodes.  This also involves inserting a new node
+   -- (since an insertion causes this), Val and its left Child.  The passed
+   -- in node (Pos) must be full.  A new node will be created to be to the
+   -- left of the node passed in, and the items in the left side of the
+   -- passed in node will be moved to the new node.  There will be one item
+   -- that will not be put into the either nodes, the middle item and its
+   -- child will be returned as the new parent to insert into the parent
+   -- node.
+   procedure Split_Node (O            : in out Object'Class;
+                         Pos          : in out Node_Ptr;
+                         Index        : in out Positive;
+                         Rightmost    : in Boolean;
+                         Val          : in Contained_Type;
+                         Child        : in Node_Ptr;
+                         Parent_Val   : out Contained_Type;
+                         Parent_Child : out Node_Ptr) is
+      New_Node    : Node_Ptr := new Node(Size => Pos.Size,
+                                         Leaf => Pos.Leaf);
+      J           : Positive;
+      Curr_Index  : Positive;
+      Prev_Index  : Positive;
+   begin
+      if (Rightmost or (Node_Item_Pos(Pos, Index) > ((Pos.Size / 2) + 1))) then
+         -- The index is on the right side, the value will be inserted into
+         -- the old node.
+
+         -- The copy into the new node is straightforward.
+         Curr_Index := Pos.First;
+         for I in 1 .. (Pos.Size / 2) loop
+            New_Node.Vals(I) := Pos.Vals(Curr_Index);
+            if (Child /= null) then
+               New_Node.Children(I) := Pos.Children(Curr_Index);
+               New_Node.Children(I).Parent := New_Node;
+               New_Node.Children(I).Parent_Index := I;
+            end if;
+            Curr_Index := Next(Pos, Curr_Index);
+         end loop;
+         -- The right child is the left child of the item that is becoming
+         -- the parent.
+         if (Child /= null) then
+            New_Node.Right_Child := Pos.Children(Curr_Index);
+            New_Node.Right_Child.Parent := New_Node;
+            New_Node.Right_Child.Parent_Index := New_Node.Size + 1;
+         end if;
+         Parent_Val := Pos.Vals(Curr_Index);
+         Prev_Index := Curr_Index;
+         Curr_Index := Next(Pos, Curr_Index);
+
+         New_Node.First := 1;
+         New_Node.Last := Pos.Size / 2;
+         if (Rightmost) then
+            Pos.First := Curr_Index;
+
+            -- If we are adding on the right, just stick it in.
+            Pos.Last := Next(Pos, Pos.Last);
+            Pos.Vals(Pos.Last) := Val;
+            if (Child /= null) then
+               Pos.Children(Pos.Last) := Child;
+               Pos.Children(Pos.Last).Parent := Pos;
+               Pos.Children(Pos.Last).Parent_Index := Pos.Last;
+            end if;
+
+            Index := Pos.Last;
+         else
+            -- Move all the values forward until we get to the index point.
+            Pos.First := Curr_Index;
+            Pos.Last := Next(Pos, Pos.Last);
+            Curr_Index := Pos.Last;
+            while (Curr_Index /= Index) loop
+               Prev_Index := Prev(Pos, Curr_Index);
+               Pos.Vals(Curr_Index) := Pos.Vals(Prev_Index);
+               if (Child /= null) then
+                  Pos.Children(Curr_Index) := Pos.Children(Prev_Index);
+                  Pos.Children(Curr_Index).Parent_Index := Curr_Index;
+               end if;
+               Curr_Index := Prev_Index;
+            end loop;
+            Pos.Vals(Index) := Val;
+            if (Child /= null) then
+               Pos.Children(Index) := Child;
+               Pos.Children(Index).Parent := Pos;
+               Pos.Children(Index).Parent_Index := Index;
+            end if;
+         end if;
+
+      elsif (Node_Item_Pos(Pos, Index) = ((Pos.Size / 2) + 1)) then
+         -- The new parent is the value passed in, so it doesn't go on
+         -- either side.
+         Parent_Val := Val;
+
+         Curr_Index := Pos.First;
+         for I in 1 .. (Pos.Size / 2) loop
+            New_Node.Vals(I) := Pos.Vals(Curr_Index);
+            if (Child /= null) then
+               New_Node.Children(I) := Pos.Children(Curr_Index);
+               New_Node.Children(I).Parent := New_Node;
+               New_Node.Children(I).Parent_Index := I;
+            end if;
+            Curr_Index := Next(Pos, Curr_Index);
+         end loop;
+         if (Child /= null) then
+            New_Node.Right_Child := Child;
+            New_Node.Right_Child.Parent := New_Node;
+            New_Node.Right_Child.Parent_Index := New_Node.Size + 1;
+         end if;
+         New_Node.First := 1;
+         New_Node.Last := Pos.Size / 2;
+
+         -- We just move the first position of Pos to remove the first
+         -- nodes.
+         Pos.First := Curr_Index;
+
+         -- No position, have to get it from the next insert.
+         Pos := null;
+
+      else
+         -- The index is on the left side, the value will be in the new node.
+
+         -- Copy values into the new node, sticking the new value in its
+         -- place when we get there.
+         Curr_Index := Pos.First;
+         J := 1;
+         while (Curr_Index /= Index) loop
+            New_Node.Vals(J) := Pos.Vals(Curr_Index);
+            if (Child /= null) then
+               New_Node.Children(J) := Pos.Children(Curr_Index);
+               New_Node.Children(J).Parent := New_Node;
+               New_Node.Children(J).Parent_Index := J;
+            end if;
+            Curr_Index := Next(Pos, Curr_Index);
+            J := J + 1;
+         end loop;
+         New_Node.Vals(J) := Val;
+         Index := J;
+         if (Child /= null) then
+            New_Node.Children(J) := Child;
+            New_Node.Children(J).Parent := New_Node;
+            New_Node.Children(J).Parent_Index := J;
+         end if;
+         J := J + 1;
+         while (J <= (Pos.Size / 2)) loop
+            New_Node.Vals(J) := Pos.Vals(Curr_Index);
+            if (Child /= null) then
+               New_Node.Children(J) := Pos.Children(Curr_Index);
+               New_Node.Children(J).Parent := New_Node;
+               New_Node.Children(J).Parent_Index := J;
+            end if;
+            Curr_Index := Next(Pos, Curr_Index);
+            J := J + 1;
+         end loop;
+
+         -- The right child is the left child of the item that is becoming
+         -- the parent.
+         if (Child /= null) then
+            New_Node.Right_Child := Pos.Children(Curr_Index);
+            New_Node.Right_Child.Parent := New_Node;
+            New_Node.Right_Child.Parent_Index := New_Node.Size + 1;
+         end if;
+         New_Node.First := 1;
+         New_Node.Last := Pos.Size / 2;
+
+         Parent_Val := Pos.Vals(Curr_Index);
+
+         -- We just move the first position of Pos to remove the first
+         -- nodes.
+         Curr_Index := Next(Pos, Curr_Index);
+         Pos.First := Curr_Index;
+
+         Pos := New_Node;
+      end if;
+
+      -- The left node is returned as the child of the parent.
+      Parent_Child := New_Node;
+   end Split_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Always inserts into a leaf node.  Inserts to the left of Index unless
+   -- rightmost is set, then it will put the value in as the rightmost
+   -- element and ignore the index.
+   procedure Insert_Into_Node (O         : in out Object'Class;
+                               Val       : in Contained_Type;
+                               Pos       : in out Node_Ptr;
+                               Index     : in out Positive;
+                               Child     : in Node_Ptr;
+                               Rightmost : in Boolean := False) is
+      Left_Search_Node  : Node_Ptr;
+      Right_Search_Node : Node_Ptr;
+      Done              : Boolean := False;
+      Parent_Val        : Contained_Type   := Val;
+      Parent_Child      : Node_Ptr         := Child;
+      Parent            : Node_Ptr;
+      Parent_Index      : Positive;
+      Curr_Node         : Node_Ptr := Pos;
+      Work_Index        : Positive := Index;
+      Curr_Index        : Positive;
+      Prev_Index        : Positive;
+      Next_Index        : Positive;
+      Local_Rightmost   : Boolean  := Rightmost;
+   begin
+      Pos := null;
+      while (not Done) loop
+         Next_Index := Next(Curr_Node, Curr_Node.Last);
+         if (Next_Index /= Curr_Node.First) then
+            -- Easy case, it will fit into the node.
+            if (Local_Rightmost) then
+               -- We are inserting a rightmost node, so some special work
+               -- with the right child.
+               Curr_Node.Vals(Next_Index) := Parent_Val;
+               if (not Curr_Node.Leaf) then
+                  -- The right child will remain valid because the inserted
+                  -- node must be less than anything in the right child.
+                  Curr_Node.Children(Next_Index) := Parent_Child;
+                  Curr_Node.Children(Next_Index).Parent := Curr_Node;
+                  Curr_Node.Children(Next_Index).Parent_Index := Next_Index;
+               end if;
+               if (Pos = null) then
+                  Pos := Curr_Node;
+                  Index := Next_Index;
+               end if;
+            else
+               -- Not the rightmost node, move stuff over.
+               Curr_Index := Next_Index;
+               Prev_Index := Curr_Node.Last;
+               while (Curr_Index /= Work_Index) loop
+                  Curr_Node.Vals(Curr_Index) := Curr_Node.Vals(Prev_Index);
+                  if (not Curr_Node.Leaf) then
+                     Curr_Node.Children(Curr_Index)
+                       := Curr_Node.Children(Prev_Index);
+                     Curr_Node.Children(Curr_Index).Parent_Index := Curr_Index;
+                  end if;
+                  Curr_Index := Prev_Index;
+                  Prev_Index := Prev(Curr_Node, Prev_Index);
+               end loop;
+               Curr_Node.Vals(Work_Index) := Parent_Val;
+               if (not Curr_Node.Leaf) then
+                  Curr_Node.Children(Work_Index) := Parent_Child;
+                  Curr_Node.Children(Work_Index).Parent_Index := Work_Index;
+                  Curr_Node.Children(Work_Index).Parent := Curr_Node;
+               end if;
+               Index := Work_Index;
+            end if;
+            Pos := Curr_Node;
+            Curr_Node.Last := Next_Index;
+            Done := True;
+
+         else
+            -- Hard case, we need to look around to see if it fits
+            -- somewhere.
+            Left_Search_Node := Left_Node(O, Curr_Node);
+            Right_Search_Node := Right_Node(O, Curr_Node);
+            while ((Left_Search_Node /= null)
+                   or (Right_Search_Node /= null))
+            loop
+               if (Left_Search_Node /= null) then
+                  if (Next(Left_Search_Node, Left_Search_Node.Last)
+                      /= Left_Search_Node.First)
+                  then
+                     -- We found another node where we can fit to the left
+                     -- of us, shift stuff around.  We find the value we
+                     -- want to move over to the tree to the left.
+                     Insert_Shift_Left(O,
+                                       Curr_Node,
+                                       Work_Index,
+                                       Parent_Val,
+                                       Parent_Child,
+                                       Local_Rightmost);
+                     if (Pos = null) then
+                        Pos := Curr_Node;
+                        Index := Work_Index;
+                     end if;
+
+                     -- We are done.
+                     Done := True;
+                     exit;
+                  end if;
+                  Left_Search_Node := Left_Node(O, Left_Search_Node);
+               end if;
+
+               if (Right_Search_Node /= null) then
+                  if (Next(Right_Search_Node, Right_Search_Node.Last)
+                      /= Right_Search_Node.First)
+                  then
+                     -- We found another node where we can fit to the Right
+                     -- of us, shift stuff around.  We find the value we
+                     -- want to move over to the tree to the Right.
+                     Insert_Shift_Right(O,
+                                        Curr_Node,
+                                        Work_Index,
+                                        Local_Rightmost,
+                                        Parent_Val,
+                                        Parent_Child);
+                     if (Pos = null) then
+                        Pos := Curr_Node;
+                        Index := Work_Index;
+                     end if;
+
+                     -- We are done.
+                     Done := True;
+                     exit;
+                  end if;
+                  Right_Search_Node := Right_Node(O, Right_Search_Node);
+               end if;
+            end loop;
+
+            if (not Done) then
+               -- the leaves are all full.  We need to do a split.
+               if (Curr_Node = O.Root) then
+                  -- The root node is full, split it.
+
+                  -- Create a new root node to parent the two newly created
+                  -- nodes.  The current node will be split and become the
+                  -- right child of the new node.
+                  Parent := new Node(Size => O.Root.Size,
+                                     Leaf => False);
+                  Parent.Right_Child := Curr_Node;
+                  Parent.Right_Child.Parent := Parent;
+                  Parent.Right_Child.Parent_Index := Parent.Size + 1;
+
+                  -- Now split the node.  The new node (with the left
+                  -- values) is returned in parent_child.  The value to put
+                  -- into the new root is returned in parent_val.
+                  Split_Node(O,
+                             Curr_Node,
+                             Work_Index,
+                             Local_Rightmost,
+                             Parent_Val,
+                             Parent_Child,
+                             Parent_Val,
+                             Parent_Child);
+
+                  if (Pos = null) then
+                     if (Curr_Node = null) then
+                        Pos := Parent;
+                        Index := 1;
+                     else
+                        Pos := Curr_Node;
+                        Index := Work_Index;
+                     end if;
+                  end if;
+                  Parent.Vals(1) := Parent_Val;
+                  Parent.Children(1) := Parent_Child;
+                  Parent.Children(1).Parent := Parent;
+                  Parent.Children(1).Parent_Index := 1;
+                  O.Root := Parent;
+                  Parent.First := 1;
+                  Parent.Last := 1;
+
+                  Done := True;
+               else
+                  Parent := Curr_Node.Parent;
+                  Parent_Index := Curr_Node.Parent_Index;
+                  Split_Node(O,
+                             Curr_Node,
+                             Work_Index,
+                             Local_Rightmost,
+                             Parent_Val,
+                             Parent_Child,
+                             Parent_Val,
+                             Parent_Child);
+
+                  if ((Curr_Node /= null) and (Pos = null)) then
+                     Pos := Curr_Node;
+                     Index := Work_Index;
+                  end if;
+                  Curr_Node := Parent;
+
+                  if (Parent_Index = (Curr_Node.Size + 1)) then
+                     -- We split a right node, we are inserting into the
+                     -- rightmost position now.
+                     Local_Rightmost := True;
+                  else
+                     Work_Index := Parent_Index;
+                     Local_Rightmost := False;
+                  end if;
+               end if;
+            end if;
+         end if;
+      end loop;
+   end Insert_Into_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Add a value to the object.  This will return the position that the
+   -- item was added at.
+   procedure Local_Add (O           : in out Object'Class;
+                        Val         : in Contained_Type;
+                        Added_Pos   : out Node_Ptr;
+                        Added_Index : out Positive) is
+      Pos   : Node_Ptr;
+      Index : Positive;
+   begin
+      Pos := O.Root;
+      if (O.Count = 0) then
+         Pos.First := 1;
+         Pos.Last := 1;
+         Pos.Vals(1) := Val;
+         Index := 1;
+      else
+         Index := Pos.First;
+         loop
+            if (Val <= Pos.Vals(Index)) then
+               if ((not O.Allow_Duplicates)
+                   and then (Val = Pos.Vals(Index)))
+               then
+                  raise Item_Already_Exists;
+               end if;
+               if (Pos.Leaf) then
+                  -- It needs to go here.
+                  Insert_Into_Node(O, Val, Pos, Index, null);
+                  exit;
+               else
+                  -- follow the left child
+                  Pos := Pos.Children(Index);
+                  Index := Pos.First;
+               end if;
+            elsif (Index = Pos.Last) then
+               -- It goes to the right of me.
+               if (Pos.Leaf) then
+                  -- It needs to go here.
+                  Insert_Into_Node(O,
+                                   Val,
+                                   Pos,
+                                   Index,
+                                   null,
+                                   Rightmost => True);
+                  exit;
+               else
+                  -- follow the rightmost child
+                  Pos := Pos.Right_Child;
+                  Index := Pos.First;
+               end if;
+            else
+               Index := Next(Pos, Index);
+            end if;
+         end loop;
+      end if;
+
+      O.Count := O.Count + 1;
+      O.Update := O.Update + 1;
+      if (O.Cb /= null) then
+         Added(O.Cb, O, Pos.Vals(Index));
+      end if;
+
+      Added_Pos := Pos;
+      Added_Index := Index;
+   end Local_Add;
+
+
+   ------------------------------------------------------------------------
+   -- Delete from the node.  The deletes by shifting things from the first
+   -- to the index.  This avoids modifying the next item's position, making
+   -- finding the next node a little easier.
+   procedure Delete_From_Node (O     : in out Object'Class;
+                               Pos   : in Node_Ptr;
+                               Index : in Positive) is
+      Curr_Index : Positive;
+      Prev_Index : Positive;
+   begin
+      Curr_Index := Index;
+      Prev_Index := Prev(Pos, Index);
+      while (Curr_Index /= Pos.First) loop
+         Pos.Vals(Curr_Index) := Pos.Vals(Prev_Index);
+         if (not Pos.Leaf) then
+            Pos.Children(Curr_Index) := Pos.Children(Prev_Index);
+            Pos.Children(Curr_Index).Parent_Index := Curr_Index;
+         end if;
+         Curr_Index := Prev_Index;
+         Prev_Index := Prev(Pos, Prev_Index);
+      end loop;
+      Pos.First := Next(Pos, Pos.First);
+   end Delete_From_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Something has been deleted from the node and it is not full any more.
+   -- If this is called, a node to our right has an extra item that can be
+   -- shifted around to this node to balance this node out.  This routine
+   -- does the shifting.
+   procedure Delete_Shift_Left (O          : in out Object'Class;
+                                Pos        : in Node_Ptr;
+                                Next_Pos   : in out Node_Ptr;
+                                Next_Index : in out Positive) is
+      Search_Node : Node_Ptr;
+      Curr_Node   : Node_Ptr := Pos;
+      Parent_Node : Node_Ptr;
+   begin
+      loop
+         Search_Node := Right_Node(O, Curr_Node);
+
+         -- Find the parent I need to swap with.  We go up the tree until
+         -- we are not a rightmost node.
+         Parent_Node := Curr_Node;
+         while (Parent_Node.Parent_Index = (Parent_Node.Parent.Size + 1)) loop
+            Parent_Node := Parent_Node.Parent;
+         end loop;
+
+         -- Now do the swap by moving the parent into the right of the
+         -- current node and the left node of our right sibling into the
+         -- parent.
+         Curr_Node.Last := Next(Curr_Node, Curr_Node.Last);
+         if ((Parent_Node.Parent = Next_Pos)
+             and (Parent_Node.Parent_Index = Next_Index))
+         then
+            -- We are moving the current next position, so move our reference
+            -- to it.
+            Next_Pos := Curr_Node;
+            Next_Index := Curr_Node.Last;
+         end if;
+         if ((Search_Node = Next_Pos)
+             and (Search_Node.First = Next_Index))
+         then
+            -- We are moving the current next position, so move our reference
+            -- to it.
+            Next_Pos := Parent_Node.Parent;
+            Next_Index := Parent_Node.Parent_Index;
+         end if;
+         Curr_Node.Vals(Curr_Node.Last)
+           := Parent_Node.Parent.Vals(Parent_Node.Parent_Index);
+         Parent_Node.Parent.Vals(Parent_Node.Parent_Index)
+           := Search_Node.Vals(Search_Node.First);
+         if (not Curr_Node.Leaf) then
+            Curr_Node.Children(Curr_Node.Last) := Curr_Node.Right_Child;
+            Curr_Node.Children(Curr_Node.Last).Parent_Index := Curr_Node.Last;
+            Curr_Node.Right_Child := Search_Node.Children(Search_Node.First);
+            Curr_Node.Right_Child.Parent := Curr_Node;
+            Curr_Node.Right_Child.Parent_Index := Curr_Node.Size + 1;
+         end if;
+         Search_Node.First := Next(Search_Node, Search_Node.First);
+
+         exit when (Node_Count(Search_Node) >= (Search_Node.Size / 2));
+         Curr_Node := Search_Node;
+      end loop;
+   end Delete_Shift_Left;
+
+
+   ------------------------------------------------------------------------
+   -- Like Delete_Shift_Left, but the item is to our left so we are
+   -- shifting right.
+   procedure Delete_Shift_Right (O          : in out Object'Class;
+                                 Pos        : in Node_Ptr;
+                                 Next_Pos   : in out Node_Ptr;
+                                 Next_Index : in out Positive) is
+      Search_Node  : Node_Ptr;
+      Curr_Node    : Node_Ptr := Pos;
+      Parent_Node  : Node_Ptr;
+      Parent_Index : Positive;
+   begin
+      loop
+         Search_Node := Left_Node(O, Curr_Node);
+
+         -- Find the parent I need to swap with.  We go up the tree until
+         -- we are not a rightmost node.
+         Parent_Node := Curr_Node;
+         while (Parent_Node.Parent_Index = Parent_Node.Parent.First) loop
+            Parent_Node := Parent_Node.Parent;
+         end loop;
+
+         -- Swap from the parent to the left of us.
+         if (Parent_Node.Parent_Index = (Parent_Node.Parent.Size + 1)) then
+            -- A right child get special handling.
+            Parent_Index := Parent_Node.Parent.Last;
+         else
+            Parent_Index := Prev(Parent_Node.Parent, Parent_Node.Parent_Index);
+         end if;
+
+         -- Now do the swap by moving the parent into the left of the
+         -- current node and the right node of our left sibling into the
+         -- parent.
+         Curr_Node.First := Prev(Curr_Node, Curr_Node.First);
+         if ((Parent_Node.Parent = Next_Pos)
+             and (Parent_Index = Next_Index))
+         then
+            -- We are moving the current next position, so move our reference
+            -- to it.
+            Next_Pos := Curr_Node;
+            Next_Index := Curr_Node.First;
+         end if;
+         if ((Search_Node = Next_Pos)
+             and (Search_Node.Last = Next_Index))
+         then
+            -- We are moving the current next position, so move our reference
+            -- to it.
+            Next_Pos := Parent_Node.Parent;
+            Next_Index := Parent_Index;
+         end if;
+         Curr_Node.Vals(Curr_Node.First)
+           := Parent_Node.Parent.Vals(Parent_Index);
+         Parent_Node.Parent.Vals(Parent_Index)
+           := Search_Node.Vals(Search_Node.Last);
+         if (not Curr_Node.Leaf) then
+            Curr_Node.Children(Curr_Node.First) := Search_Node.Right_Child;
+            Curr_Node.Children(Curr_Node.First).Parent := Curr_Node;
+            Curr_Node.Children(Curr_Node.First).Parent_Index
+              := Curr_Node.First;
+            Search_Node.Right_Child := Search_Node.Children(Search_Node.Last);
+            Search_Node.Right_Child.Parent_Index := Search_Node.Size + 1;
+         end if;
+         Search_Node.Last := Prev(Search_Node, Search_Node.Last);
+
+         exit when (Node_Count(Search_Node) >= (Search_Node.Size / 2));
+         Curr_Node := Search_Node;
+      end loop;
+   end Delete_Shift_Right;
+
+
+   ------------------------------------------------------------------------
+   -- Move the data from node1 into node2, including node1's parent.
+   procedure Combine_Nodes (O          : in out Object'Class;
+                            Node1      : in Node_Ptr;
+                            Node2      : in Node_Ptr;
+                            Next_Pos   : in out Node_Ptr;
+                            Next_Index : in out Positive) is
+   begin
+      -- First put in the parent.
+      Node2.First := Prev(Node2, Node2.First);
+      if ((Node1.Parent = Next_Pos)
+          and (Node1.Parent_Index = Next_Index))
+      then
+         -- We are moving the current next position, so move our reference
+         -- to it.
+         Next_Pos := Node2;
+         Next_Index := Node2.First;
+      end if;
+      Node2.Vals(Node2.First) := Node1.Parent.Vals(Node1.Parent_Index);
+      if (not Node1.Leaf) then
+         Node2.Children(Node2.First) := Node1.Right_Child;
+         Node2.Children(Node2.First).Parent := Node2;
+         Node2.Children(Node2.First).Parent_Index := Node2.First;
+      end if;
+
+      loop
+         Node2.First := Prev(Node2, Node2.First);
+
+         if ((Node1 = Next_Pos)
+             and (Node1.Last = Next_Index))
+         then
+            -- We are moving the current next position, so move our reference
+            -- to it.
+            Next_Pos := Node2;
+            Next_Index := Node2.First;
+         end if;
+         Node2.Vals(Node2.First) := Node1.Vals(Node1.Last);
+         if (not Node1.Leaf) then
+            Node2.Children(Node2.First) := Node1.Children(Node1.Last);
+            Node2.Children(Node2.First).Parent := Node2;
+            Node2.Children(Node2.First).Parent_Index := Node2.First;
+         end if;
+         exit when (Node1.Last = Node1.First);
+         Node1.Last := Prev(Node1, Node1.Last);
+      end loop;
+   end Combine_Nodes;
+
+
+   ------------------------------------------------------------------------
+   -- Delete an item from the tree.  The new position of the item following
+   -- the deleted one is returned in New_Next_Pos and New_Next_Index.
+   -- Is_End denotes if the last item in the Btree was deleted or not.
+   procedure Local_Delete (O              : in out Object'Class;
+                           Pos            : in Node_Ptr;
+                           Index          : in Positive;
+                           New_Next_Pos   : out Node_Ptr;
+                           New_Next_Index : out Positive;
+                           Is_End         : out End_Marker) is
+      Hold_Val           : Contained_Type;
+      Node               : Node_Ptr       := Pos;
+      Curr_Index         : Positive       := Index;
+      Done               : Boolean        := False;
+      Left_Search_Node   : Node_Ptr;
+      Right_Search_Node  : Node_Ptr;
+      Combine_Left_Node  : Node_Ptr;
+      Combine_Right_Node : Node_Ptr;
+      Next_Index         : Positive;
+      Prev_Index         : Positive;
+      Return_Next_Pos    : Node_Ptr := Pos;
+      Return_Next_Index  : Positive := Index;
+      Local_Is_End       : End_Marker;
+   begin
+      Hold_Val := Node.Vals(Index);
+
+      -- Pull the rightmost value from the left children until we hit a
+      -- leaf node.  This will guarantee the ordering does not change
+      -- without swapping any nodes around.
+      if (not Node.Leaf) then
+         Node := Node.Children(Curr_Index);
+         while (not Node.Leaf) loop
+            Node := Node.Right_Child;
+         end loop;
+         -- Pull the rightmost value out of the rightmost subtree of my
+         -- left child and replace the removed value with it.
+         Curr_Index := Node.Last;
+         Pos.Vals(Index) := Node.Vals(Curr_Index);
+      end if;
+
+      -- Go ahead and find the next node.
+      Local_Next(O, Return_Next_Pos, Return_Next_Index, Local_Is_End);
+      Is_End := Local_Is_End;
+      if (Local_Is_End = Past_End) then
+         -- Set the next position null so it won't get updated.
+         Return_Next_Pos := null;
+      end if;
+
+      -- Now we are guaranteed to be a leaf node, we can actually remove
+      -- something.  The following loop will go up the tree until it finds
+      -- a level were a combination is not required.
+      while (not Done) loop
+         if (Node_Count(Node) > (Node.Size / 2)) then
+            -- Easy case, just remove the index.
+
+            Delete_From_Node(O, Node, Curr_Index);
+            Done := True;
+         else
+            -- Our node is too empty.  First try to steal from the left or
+            -- right siblings.
+            Left_Search_Node := Left_Node(O, Node);
+            Right_Search_Node := Right_Node(O, Node);
+            while ((Left_Search_Node /= null)
+                   or (Right_Search_Node /= null))
+            loop
+               if (Left_Search_Node /= null) then
+                  if (Node_Count(Left_Search_Node)
+                      > (Left_Search_Node.Size / 2))
+                  then
+                     -- Go ahead and delete the thing from the node before
+                     -- we rotate stuff around.
+                     Delete_From_Node(O, Node, Curr_Index);
+
+                     -- We found another node where we can fit to the left
+                     -- of us, shift stuff around.  We find the value we
+                     -- want to move over to the tree to the left.
+                     Delete_Shift_Right(O,
+                                        Node,
+                                        Return_Next_Pos,
+                                        Return_Next_Index);
+
+                     -- We are done.
+                     Done := True;
+                     exit;
+                  end if;
+                  Left_Search_Node := Left_Node(O, Left_Search_Node);
+               end if;
+
+               if (Right_Search_Node /= null) then
+                  if (Node_Count(Right_Search_Node)
+                      > (Right_Search_Node.Size / 2))
+                  then
+                     -- Go ahead and delete the thing from the node before
+                     -- we rotate stuff around.
+                     Delete_From_Node(O, Node, Curr_Index);
+
+                     -- We found another node where we can pull from to the
+                     -- right of us, shift stuff around.  We find the value we
+                     -- want to move over to the tree to the Right.
+                     Delete_Shift_Left(O,
+                                       Node,
+                                       Return_Next_Pos,
+                                       Return_Next_Index);
+
+                     -- We are done.
+                     Done := True;
+                     exit;
+                  end if;
+                  Right_Search_Node := Right_Node(O, Right_Search_Node);
+               end if;
+            end loop;
+         end if;
+
+         if (not Done) then
+            -- No leaf nodes have any leftover items, time to start
+            -- combining nodes.
+
+            if (Node = O.Root) then
+               -- Root node does not have a minimum allowed count.
+               -- However, we might have to promote our child to root if we
+               -- are going to be empty.
+               if (Node_Count(Node) = 1) then
+                  if (not Node.Leaf) then
+                     -- Promoting our one child to root.  The algorithm
+                     -- leaves the left child to the right of the deleted
+                     -- position, so the left child is no longer valid.
+                     O.Root := Node.Right_Child;
+                     O.Root.Parent := null;
+                     O.Root.Parent_Index := 1;
+                     Free_Node(Node);
+                  end if;
+                  -- If root is a leaf not and deleting the last item, the
+                  -- count will become zero in the container and that is
+                  -- handled as a special case.
+               else
+                  Delete_From_Node(O, Node, Curr_Index);
+               end if;
+               Done := True;
+            else
+               if (Node.Parent_Index = Node.Parent.First) then
+                  -- We are the leftmost node, combine with our right
+                  -- neighbor.
+                  Combine_Left_Node := Node;
+                  Next_Index := Next(Node.Parent, Node.Parent_Index);
+                  if (Node.Parent_Index = Node.Parent.Last) then
+                     -- We are the rightmost node, take the right child.
+                     Combine_Right_Node := Node.Parent.Right_Child;
+                  else
+                     Combine_Right_Node := Node.Parent.Children(Next_Index);
+                  end if;
+               else
+                  -- We are not leftmost, combine with our left neighbor.
+                  Combine_Right_Node := Node;
+                  if (Node.Parent_Index = (Node.Parent.Size + 1)) then
+                     Prev_Index := Node.Parent.Last;
+                  else
+                     Prev_Index := Prev(Node.Parent, Node.Parent_Index);
+                  end if;
+                  Combine_Left_Node := Node.Parent.Children(Prev_Index);
+               end if;
+
+               -- Go ahead and delete the thing from the node before we
+               -- combine.
+               Delete_From_Node(O, Node, Curr_Index);
+
+               Curr_Index := Combine_Left_Node.Parent_Index;
+               Node := Node.Parent;
+               Combine_Nodes(O,
+                             Combine_Left_Node,
+                             Combine_Right_Node,
+                             Return_Next_Pos,
+                             Return_Next_Index);
+               Free_Node(Combine_Left_Node);
+            end if;
+         end if;
+      end loop;
+
+      New_Next_Pos := Return_Next_Pos;
+      New_Next_Index := Return_Next_Index;
+
+      O.Count := O.Count - 1;
+      O.Update := O.Update + 1;
+      if (O.Cb /= null) then
+         Deleted(O.Cb, O, Hold_Val);
+      end if;
+   end Local_Delete;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+      null;
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+      New_Tree   : Node_Ptr;
+      Curr_Node  : Node_Ptr;
+      Curr_Index : Positive;
+   begin
+      New_Tree := new Node'(O.Root.all);
+      Curr_Node := New_Tree;
+      if (O.Count = 0) then
+         -- The tree is empty, nothing to do.
+         null;
+      elsif (Curr_Node.Leaf) then
+         -- Only a root node, call copied for its children.
+         if (O.Cb /= null) then
+            Curr_Index := Curr_Node.First;
+            loop
+               Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+               exit when (Curr_Index = Curr_Node.Last);
+               Curr_Index := Next(Curr_Node, Curr_Index);
+            end loop;
+         end if;
+      else
+         -- Call copied for the root node.
+         if (O.Cb /= null) then
+            Curr_Index := Curr_Node.First;
+            loop
+               Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+               exit when (Curr_Index = Curr_Node.Last);
+               Curr_Index := Next(Curr_Node, Curr_Index);
+            end loop;
+         end if;
+
+         Curr_Index := Curr_Node.First;
+         -- Do an pre-order traversal of the tree, creating the nodes as we
+         -- visit them.
+         Main_Loop: loop
+            -- Create the new node.
+            Curr_Node.Children(Curr_Index)
+              := new Node'(Curr_Node.Children(Curr_Index).all);
+            Curr_Node.Children(Curr_Index).Parent := Curr_Node;
+
+            if (not Curr_Node.Children(Curr_Index).Leaf) then
+               -- Not a leaf node, move to the new node, call copied on its
+               -- members, and process this node next.
+               Curr_Node := Curr_Node.Children(Curr_Index);
+               Curr_Index := Curr_Node.First;
+               if (O.Cb /= null) then
+                  loop
+                     Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+                     exit when (Curr_Index = Curr_Node.Last);
+                     Curr_Index := Next(Curr_Node, Curr_Index);
+                  end loop;
+               end if;
+               Curr_Index := Curr_Node.First;
+            else
+               -- A leaf node.  Call copied on all the members and stay at
+               -- the parent.
+               if (O.Cb /= null) then
+                  Curr_Node := Curr_Node.Children(Curr_Index);
+                  Curr_Index := Curr_Node.First;
+                  loop
+                     Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+                     exit when (Curr_Index = Curr_Node.Last);
+                     Curr_Index := Next(Curr_Node, Curr_Index);
+                  end loop;
+                  Curr_Index := Curr_Node.Parent_Index;
+                  Curr_Node := Curr_Node.Parent;
+               end if;
+
+               if (Curr_Index /= Curr_Node.Last) then
+                  Curr_Index := Next(Curr_Node, Curr_Index);
+               else
+                  Curr_Node.Right_Child
+                    := new Node'(Curr_Node.Right_Child.all);
+                  Curr_Node.Right_Child.Parent := Curr_Node;
+
+                  if (not Curr_Node.Right_Child.Leaf) then
+                     -- Not a leaf node, move to the new node, call copied
+                     -- on its members, and process this node next.
+                     Curr_Node := Curr_Node.Right_Child;
+                     Curr_Index := Curr_Node.First;
+                     if (O.Cb /= null) then
+                        loop
+                           Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+                           exit when (Curr_Index = Curr_Node.Last);
+                           Curr_Index := Next(Curr_Node, Curr_Index);
+                        end loop;
+                     end if;
+                     Curr_Index := Curr_Node.First;
+                  else
+                     -- A leaf node.  Call copied on all the members and
+                     -- then we must go up.
+                     if (O.Cb /= null) then
+                        Curr_Node := Curr_Node.Right_Child;
+                        Curr_Index := Curr_Node.First;
+                        loop
+                           Copied(O.Cb, O, Curr_Node.Vals(Curr_Index));
+                           exit when (Curr_Index = Curr_Node.Last);
+                           Curr_Index := Next(Curr_Node, Curr_Index);
+                        end loop;
+                        Curr_Index := Curr_Node.Parent_Index;
+                        Curr_Node := Curr_Node.Parent;
+                     end if;
+
+                     -- Time to go up the tree.
+                     if (Curr_Node = New_Tree) then
+                        -- If we are at the root of the tree, we are done.
+                        exit Main_Loop;
+                     end if;
+
+                     -- Go up while we are the right child, since the node
+                     -- is done at that point.
+                     while (Curr_Node.Parent_Index
+                            = (Curr_Node.Parent.Size + 1))
+                     loop
+                        Curr_Node := Curr_Node.Parent;
+                        if (Curr_Node = New_Tree) then
+                           -- If we are at the root of the tree, we are done.
+                           exit Main_Loop;
+                        end if;
+                     end loop;
+
+                     -- Now we need to follow down the next right subtree
+                     -- of our parent.
+                     if (Curr_Node.Parent_Index = Curr_Node.Parent.Last) then
+                        -- We need to go down the right child.
+                        Curr_Node := Curr_Node.Parent.Right_Child;
+                     else
+                        Curr_Index := Next(Curr_Node.Parent,
+                                           Curr_Node.Parent_Index);
+                        Curr_Node := Curr_Node.Parent.Children(Curr_Index);
+                     end if;
+                     Curr_Index := Curr_Node.First;
+                  end if;
+               end if;
+            end if;
+         end loop Main_Loop;
+      end if;
+
+      O.Root := New_Tree;
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+      Curr_Node  : Node_Ptr;
+      Curr_Index : Positive;
+   begin
+      Curr_Node := O.Root;
+      if (O.Count = 0) then
+         Free_Node(O.Root);
+      elsif (Curr_Node.Leaf) then
+         -- Only a root node, delete it children.
+         if (O.Cb /= null) then
+            loop
+               Deleted(O.Cb, O, Curr_Node.Vals(Curr_Node.First));
+               exit when (Curr_Node.First = Curr_Node.Last);
+               Curr_Node.First := Next(Curr_Node, Curr_Node.First);
+            end loop;
+         end if;
+         Free_Node(O.Root);
+      else
+         -- Do an in-order traversal of the tree, deleting the nodes as we
+         -- visit them.
+
+         -- Seek to the leftmost leaf node.
+         while (not Curr_Node.Leaf) loop
+            Curr_Node := Curr_Node.Children(Curr_Node.First);
+         end loop;
+
+         Main_Loop: loop
+            if (O.Cb /= null) then
+               loop
+                  Deleted(O.Cb, O, Curr_Node.Vals(Curr_Node.First));
+                  exit when (Curr_Node.First = Curr_Node.Last);
+                  Curr_Node.First := Next(Curr_Node, Curr_Node.First);
+               end loop;
+            end if;
+
+            Curr_Index := Curr_Node.Parent_Index;
+            Curr_Node := Curr_Node.Parent;
+            if (Curr_Index = (Curr_Node.Size + 1)) then
+               -- Set up to delete the parent on the next time through the
+               -- loop.
+               Free_Node(Curr_Node.Right_Child);
+               if (Curr_Node = O.Root) then
+                  Free_Node(O.Root);
+                  exit Main_Loop;
+               end if;
+            else
+               -- Find the leftmost child of the node to the right of the
+               -- one I am deleting.
+               if (O.Cb /= null) then
+                  Deleted(O.Cb, O, Curr_Node.Vals(Curr_Index));
+               end if;
+               Free_Node(Curr_Node.Children(Curr_Index));
+               if (Curr_Index = Curr_Node.Last) then
+                  Curr_Node := Curr_Node.Right_Child;
+               else
+                  Curr_Index := Next(Curr_Node, Curr_Index);
+                  Curr_Node := Curr_Node.Children(Curr_Index);
+               end if;
+               -- Seek to the leftmost leaf node.
+               while (not Curr_Node.Leaf) loop
+                  Curr_Node := Curr_Node.Children(Curr_Node.First);
+               end loop;
+               Curr_Index := Curr_Node.First;
+            end if;
+         end loop Main_Loop;
+      end if;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Add (O : in out Object; Val : in Contained_Type) is
+      Pos   : Node_Ptr;
+      Index : Positive;
+   begin
+      Check_Object(O);
+
+      Local_Add(O, Val, Pos, Index);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      Pos        : Node_Ptr;
+      Index      : Positive;
+      Found      : Boolean;
+      Next_Pos   : Node_Ptr;
+      Next_Index : Positive;
+      Is_End     : End_Marker;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Pos, Index, Found);
+      if (not Found) then
+         raise Item_Not_Found;
+      end if;
+
+      Local_Delete(O, Pos, Index, Next_Pos, Next_Index, Is_End);
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+      Pos   : Node_Ptr;
+      Index : Positive;
+      Found : Boolean;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Pos, Index, Found);
+      return Found;
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+      Pos1   : Node_Ptr;
+      Index1 : Positive;
+      Pos2   : Node_Ptr;
+      Index2 : Positive;
+      Is_End : End_Marker;
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Count /= O2.Count) then
+         return False;
+      elsif ((O1.Count = 0) and (O2.Count = 0)) then
+         return True;
+      else
+         Local_First(O1, Pos1, Index1, Is_End);
+         Local_First(O2, Pos2, Index2, Is_End);
+         while (Is_End = Not_Past_End) loop
+            if (Pos1.Vals(Index1) /= Pos1.Vals(Index2)) then
+               return False;
+            end if;
+
+            Local_Next(O1, Pos1, Index1, Is_End);
+            Local_Next(O2, Pos2, Index2, Is_End);
+         end loop;
+
+         return True;
+      end if;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object)
+                          return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   function Recurse_Verify (O            : in Object;
+                            Pos          : in Node_Ptr;
+                            Use_Min      : in Boolean;
+                            Min_Val      : in Contained_Type;
+                            Use_Max      : in Boolean;
+                            Max_Val      : in Contained_Type;
+                            Parent       : in Node_Ptr;
+                            Parent_Index : in Positive)
+                            return Natural is
+      Index      : Positive;
+      Next_Index : Positive;
+      Count      : Natural := 0;
+   begin
+      if ((Pos.Parent /= Parent)
+          or (Pos.Parent_Index /= Parent_Index))
+      then
+         raise Internal_Btree_Error;
+      end if;
+
+      Count := Node_Count(Pos);
+      if ((Pos /= O.Root) and (Count < (Pos.Size / 2))) then
+         raise Internal_Btree_Error;
+      end if;
+
+
+      Index := Pos.First;
+      if (not Pos.Leaf) then
+         Count := Count + Recurse_Verify(O,
+                                         Pos.Children(Pos.First),
+                                         Use_Min,
+                                         Min_Val,
+                                         True,
+                                         Pos.Vals(Pos.First),
+                                         Pos,
+                                         Pos.First);
+      end if;
+      if (Use_Min) then
+         if (Min_Val > Pos.Vals(Pos.First)) then
+            raise Internal_Btree_Error;
+         end if;
+      end if;
+      while (Index /= Pos.Last) loop
+         Next_Index := Next(Pos, Index);
+         if (Pos.Vals(Index) > Pos.Vals(Next_Index)) then
+            raise Internal_Btree_Error;
+         end if;
+
+         if (not Pos.Leaf) then
+            Count := Count + Recurse_Verify(O,
+                                            Pos.Children(Next_Index),
+                                            True,
+                                            Pos.Vals(Index),
+                                            True,
+                                            Pos.Vals(Next_Index),
+                                            Pos,
+                                            Next_Index);
+         end if;
+
+         Index := Next_Index;
+      end loop;
+
+      if (Use_Max) then
+         if (Max_Val < Pos.Vals(Pos.Last)) then
+            raise Internal_Btree_Error;
+         end if;
+      end if;
+
+      if (not Pos.Leaf) then
+         Count := Count + Recurse_Verify(O,
+                                         Pos.Right_Child,
+                                         True,
+                                         Pos.Vals(Pos.Last),
+                                         Use_Max,
+                                         Max_Val,
+                                         Pos,
+                                         Pos.Size + 1);
+      end if;
+
+      return Count;
+   end Recurse_Verify;
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      Count : Natural;
+   begin
+      Check_Object(O);
+      if (O.Count = 0) then
+         return;
+      end if;
+
+      Count := Recurse_Verify(O,
+                              O.Root,
+                              False,
+                              O.Root.Vals(O.Root.First),
+                              False,
+                              O.Root.Vals(O.Root.First),
+                              null,
+                              1);
+      if (Count /= O.Count) then
+         raise Internal_Btree_Error;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval : Object_Ptr;
+   begin
+      Retval := new Object(Allow_Duplicates => O.Allow_Duplicates,
+                           Node_Size        => O.Node_Size);
+
+      -- Adjust will take care of copying all the data.
+      Retval.all := O;
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_Class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := Invalid_Update;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+      Local_Is_End : End_Marker;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_First(Iter.Robj.all, Iter.Pos, Iter.Index, Local_Is_End);
+      Is_End := Local_Is_End;
+      if (Local_Is_End = Not_Past_End) then
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Last (Iter : in out Iterator; Is_End : out End_Marker) is
+      Local_Is_End : End_Marker;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Last(Iter.Robj.all, Iter.Pos, Iter.Index, Local_Is_End);
+      Is_End := Local_Is_End;
+      if (Local_Is_End = Not_Past_End) then
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Last;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+      Pos   : Node_Ptr;
+      Index : Positive;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Add(Iter.Robj.all, Val, Pos, Index);
+      Iter.Pos := Pos;
+      Iter.Index := Index;
+      Iter.Update := Iter.Robj.Update;
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Search (Iter  : in out Iterator;
+                     Val   : in Contained_Type;
+                     Found : out Boolean) is
+      Pos         : Node_Ptr;
+      Index       : Positive;
+      Local_Found : Boolean;
+      Tmp_Pos     : Node_Ptr;
+      Tmp_Index   : Positive;
+      Is_End      : End_Marker;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Search(Iter.Robj.all, Val, Pos, Index, Local_Found);
+      Found := Local_Found;
+      if (Local_Found) then
+         if (Iter.Robj.Allow_Duplicates) then
+            -- if duplicates are allowed, this might not be the first
+            -- element with the given value.  Move to previous nodes until
+            -- we find one that is not the specified value and return the
+            -- first element with the specified value.
+            Tmp_Pos := Pos;
+            Tmp_Index := Index;
+            Local_Prev(Iter.Robj.all, Tmp_Pos, Tmp_Index, Is_End);
+            while ((Is_End = Not_Past_End)
+                   and then (Tmp_Pos.Vals(Tmp_Index) = Val))
+            loop
+               Pos := Tmp_Pos;
+               Index := Tmp_Index;
+               Local_Prev(Iter.Robj.all, Tmp_Pos, Tmp_Index, Is_End);
+            end loop;
+         end if;
+
+         Iter.Pos := Pos;
+         Iter.Index := Index;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Search;
+
+
+   ------------------------------------------------------------------------
+   procedure Search_Again (Iter  : in out Iterator;
+                           Found : out Boolean) is
+      Pos    : Node_Ptr := Iter.Pos;
+      Index  : Positive := Iter.Index;
+      Is_End : End_Marker;
+   begin
+      Check_Iterator(Iter);
+
+      Local_Next(Iter.Robj.all, Pos, Index, Is_End);
+      if (Is_End = Past_End) then
+         Found := False;
+      elsif (Iter.Pos.Vals(Iter.Index) /= Pos.Vals(Index)) then
+         Found := False;
+      else
+         Found := True;
+         Iter.Pos := Pos;
+         Iter.Index := Index;
+      end if;
+   end Search_Again;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Local_Next(Iter.Robj.all, Iter.Pos, Iter.Index, Is_End);
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Prev (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Local_Prev(Iter.Robj.all, Iter.Pos, Iter.Index, Is_End);
+   end Prev;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+      Local_Is_End : End_Marker;
+   begin
+      Check_Iterator(Iter);
+
+      Local_Delete(Iter.Robj.all,
+                   Iter.Pos,
+                   Iter.Index,
+                   Iter.Pos,
+                   Iter.Index,
+                   Local_Is_End);
+      Is_End := Local_Is_End;
+      if (Local_Is_End = Not_Past_End) then
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      return ((Iter1.Pos = Iter2.Pos) and (Iter1.Index = Iter2.Index));
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Pos.Vals(Iter.Index);
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Val := Iter.Pos.Vals(Iter.Index);
+      Next(Iter, Is_End);
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Decr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Val := Iter.Pos.Vals(Iter.Index);
+      Prev(Iter, Is_End);
+   end Get_Decr;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Pos.Vals(Iter1.Index) = Iter2.Pos.Vals(Iter2.Index));
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) = Val);
+   end "=";
+
+   ------------------------------------------------------------------------
+   function ">" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Pos.Vals(Iter1.Index) > Iter2.Pos.Vals(Iter2.Index));
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function ">" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) > Val);
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function ">" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val > Iter.Pos.Vals(Iter.Index));
+   end ">";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Pos.Vals(Iter1.Index) < Iter2.Pos.Vals(Iter2.Index));
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) < Val);
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function "<" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val < Iter.Pos.Vals(Iter.Index));
+   end "<";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Pos.Vals(Iter1.Index) >= Iter2.Pos.Vals(Iter2.Index));
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Iter : in Iterator; Val : in Contained_Type)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) >= Val);
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function ">=" (Val : in Contained_Type; Iter : in Iterator)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val >= Iter.Pos.Vals(Iter.Index));
+   end ">=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Pos.Vals(Iter1.Index) <= Iter2.Pos.Vals(Iter2.Index));
+   end "<=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Iter : in Iterator; Val : in Contained_Type)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Pos.Vals(Iter.Index) <= Val);
+   end "<=";
+
+
+   ------------------------------------------------------------------------
+   function "<=" (Val : in Contained_Type; Iter : in Iterator)
+                  return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val <= Iter.Pos.Vals(Iter.Index));
+   end "<=";
+
+end Asgc.Btree.DynamicMANAGED;

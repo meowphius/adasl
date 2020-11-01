@@ -1,0 +1,1455 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Heap.CTYPEMANAGED is
+
+--$START DYNAMIC
+   procedure Free_Node is new Ada.Unchecked_Deallocation(Node,
+                                                         Node_Ptr);
+--$END DYNAMIC
+--$START EXPANDABLE
+   procedure Free_Heap_Array is new Ada.Unchecked_Deallocation(Heap_Array,
+                                                               Heap_Array_Ptr);
+--$END EXPANDABLE
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+
+      if (Iter.Pos = NULL_REF) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_No_Pos (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+   end Check_Iterator_No_Pos;
+
+
+   -- A heap is organized in a tree-like structure, except that instead of
+   -- the standard left < node < right structure, we use node > left and
+   -- node > right.  So we might have:
+   --
+   --                            99
+   --                  87                 77
+   --             76       33         66       39
+   --           23  12   10  9      44  22
+   --
+   -- This is the "virtual" structure, the actual structure varies with
+   -- implementation.  In this structure, 99 is at the "top" of the heap.
+   -- It is also the "first" item.  22 is the "last" item in the heap.  The
+   -- item directly above another item is its "parent", down and to the
+   -- left is the left child, and down and to the right is the right child.
+   -- The next item to the direct left is called the "left neighbor".  If
+   -- the item is on the left side of the tree, then the left neighbor is
+   -- the rightmost entry on the row above the value.  The "right neighbor"
+   -- is similar except it goes to the right and will go to the row below
+   -- the value if the value is on the right of the tree.
+   --
+   -- So in the example above, we have:
+   --
+   --       parent  left child  right child   left neighbor  right neighbor
+   --       ------  ----------  -----------   -------------  --------------
+   --  76     87        23          12             77             33
+   --  66     77        44          22             33             39
+   --  39     77        --          --             66             23
+   --  99     --        87          77             --             87
+   --  22     66        --          --             44             --
+   --
+
+--$START DYNAMIC
+   ------------------------------------------------------------------------
+   -- Dynamic heaps are implemented as a tree with up, left, and right
+   -- pointers.
+
+   ------------------------------------------------------------------------
+   -- Return the parent of the current node in the heap.
+   function Parent (O   : in Object'Class;
+                    Pos : in Node_Ptr)
+                    return Node_Ptr is
+   begin
+      return Pos.Up;
+   end Parent;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the left child of the given node.
+   function Left_Child (O   : in Object'Class;
+                        Pos : in Node_Ptr)
+                        return Node_Ptr is
+   begin
+      return (Pos.Left);
+   end Left_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the right child of the given node.
+   function Right_Child (O   : in Object'Class;
+                         Pos : in Node_Ptr)
+                         return Node_Ptr is
+   begin
+      return (Pos.Right);
+   end Right_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "left" of the given node.
+   function Left_Neighbor (O   : in Object'Class;
+                           Pos : in Node_Ptr)
+                           return Node_Ptr is
+      Retval     : Node_Ptr := Pos;
+      Left_Count : Natural := 0;
+   begin
+      if (Retval.Up = null) then
+         return null;
+      else
+         -- Go up left tree branches until we don't go up one any more.
+         while ((Retval.Up /= null) and then (Retval.Up.Left = Retval)) loop
+            Retval := Retval.Up;
+            Left_Count := Left_Count + 1;
+         end loop;
+
+         if (Retval.Up /= null) then
+            -- If we didn't hit the top of the tree, start go to the left
+            -- value.  We don't need to subtract one because we didn't go
+            -- all the way up to the node.
+            Retval := Retval.Up.Left;
+         else
+            -- We hit the top of the tree, we will go down, but subtract
+            -- one so we will go down to the row above the starting
+            -- position.
+            Left_Count := Left_Count - 1;
+         end if;
+
+         -- Go down right members until we hit the end.  Because a heap is
+         -- always balanced, we are guaranteed to succeed here.
+         while (Left_Count > 0) loop
+            Retval := Retval.Right;
+            Left_Count := Left_Count - 1;
+         end loop;
+      end if;
+
+      if (Retval = null) then
+         raise Internal_Heap_Error;
+      end if;
+
+      return Retval;
+   end Left_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "right" of the given node.
+   function Right_Neighbor (O   : in Object'Class;
+                            Pos : in Node_Ptr)
+                            return Node_Ptr is
+      Retval      : Node_Ptr := Pos;
+      Right_Count : Natural := 0;
+   begin
+      if (Retval.Up = null) then
+         -- The top node is easy.
+         Retval := Retval.Left;
+      else
+         -- Go up right tree branches until we don't go up one any more.
+         while ((Retval.Up /= null) and then (Retval.Up.Right = Retval)) loop
+            Retval := Retval.Up;
+            Right_Count := Right_Count + 1;
+         end loop;
+
+         if (Retval.Up /= null) then
+            -- If we didn't hit the top of the tree, start go to the left
+            -- value.  We don't need to add one because the following
+            -- operation starts us down one value already
+            Retval := Retval.Up.Right;
+         else
+            -- We hit the top of the tree, we will go down, but add one so
+            -- we will go down to the row below the starting position.
+            Right_Count := Right_Count + 1;
+         end if;
+
+         -- Go down left members until we hit the end.  Because a heap is
+         -- always balanced, we are guaranteed to succeed here.
+         while (Right_Count > 0) loop
+            Retval := Retval.Left;
+            Right_Count := Right_Count - 1;
+         end loop;
+      end if;
+
+      -- It's ok if Retval is null here, that means there was no right
+      -- neighbor (if it is at the tail of the heap, that is).
+      if ((Retval = null) and (Pos /= O.Tail)) then
+         raise Internal_Heap_Error;
+      end if;
+
+      return Retval;
+   end Right_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Add a new value into the last position in the heap.
+   procedure Add_New_Last (O   : in out Object'Class;
+                           Val : in Contained_Type) is
+      New_Parent  : Node_Ptr := O.Tail;
+      Right_Count : Natural := 0;
+   begin
+      if (O.Head = null) then
+         -- Heap is empty, add the head node.
+         New_Parent := new Node;
+         New_Parent.Up := null;
+         New_Parent.Val := Val;
+         O.Tail := New_Parent;
+         O.Head := New_Parent;
+      elsif (New_Parent.Up = null) then
+         -- The heap has one item, add it to the left of the head.
+         New_Parent.Left := new Node;
+         New_Parent.Left.Up := New_Parent;
+         New_Parent.Left.Val := Val;
+         O.Tail := New_Parent.Left;
+      else
+         -- The heap has more than one value, so we need to search for the
+         -- value to ther right of the tail.  So we are looking for the
+         -- empty right neighbor of the tail value.
+
+         -- Go up right tree branches until we don't go up one any more.
+         while ((New_Parent.Up /= null)
+                and then (New_Parent.Up.Right = New_Parent))
+         loop
+            New_Parent := New_Parent.Up;
+            Right_Count := Right_Count + 1;
+         end loop;
+
+         if (Right_Count = 0) then
+            -- The value goes in our parent's right child, so the operation
+            -- is easy.
+            New_Parent := New_Parent.Up;
+            New_Parent.Right := new Node;
+            New_Parent.Right.Up := New_Parent;
+            New_Parent.Right.Val := Val;
+            O.Tail := New_Parent.Right;
+         else
+            -- Ok, we've got to search for the value.
+
+            -- if we are not at the tree top, we move to the right child of
+            -- the current parent.  We subtract one because we don't want
+            -- to go all the way to the bottom.
+            if (New_Parent.Up /= null) then
+               New_Parent := New_Parent.Up.Right;
+               Right_Count := Right_Count - 1;
+            end if;
+
+            -- Now start going down left trees.
+            while (Right_Count > 0) loop
+               New_Parent := New_Parent.Left;
+               Right_Count := Right_Count - 1;
+            end loop;
+
+            -- We will always add to the left child here, because if we
+            -- traverse beyond our direct parent then neither node of the
+            -- place where we put it will have a value in it.
+            New_Parent.Left := new Node;
+            New_Parent.Left.Up := New_Parent;
+            New_Parent.Left.Val := Val;
+            O.Tail := New_Parent.Left;
+         end if;
+      end if;
+
+      O.Count := O.Count + 1;
+   end Add_New_Last;
+
+
+   ------------------------------------------------------------------------
+   -- Remove the tail value from the heap.  This routine should not be
+   -- called if the tail is at the top of the tree.
+   procedure Remove_Last (O : in out Object'Class) is
+      Left     : REF_VAL;
+      Right    : REF_VAL;
+      Up       : REF_VAL;
+   begin
+      -- Remove the tail from the tree.  No reason to check Node.Up to
+      -- see if it is null, the tail had a left neighbor so this is
+      -- guaranteed.
+      Up := Parent(O, O.Tail);
+      Left := Left_Child(O, Up);
+      Right := Right_Child(O, Up);
+      if (Left = O.Tail) then
+         Up.Left := NULL_REF;
+      elsif (Right = O.Tail) then
+         Up.Right := NULL_REF;
+      else
+         raise Internal_Heap_Error;
+      end if;
+      O.Count := O.Count - 1;
+   end Remove_Last;
+--$END DYNAMIC
+
+--$START FIXED
+   ------------------------------------------------------------------------
+   -- Fixed heaps are implemented as an array.  This make finding the left
+   -- and right neighbors easy, but it makes finding the children and
+   -- parents a little more complex.
+
+   ------------------------------------------------------------------------
+   -- Return the parent of the current node in the heap.  Since the heap is
+   -- binary, we can just divide by two.
+   function Parent (O   : in Object'Class;
+                    Pos : in Node_Ref)
+                    return Node_Ref is
+   begin
+      if (Pos = 1) then
+         return Null_Node;
+      else
+         return Pos / 2;
+      end if;
+   end Parent;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the left child of the given node.  Since the
+   -- heap is binary, we can multiply by two.
+   function Left_Child (O   : in Object'Class;
+                        Pos : in Node_Ref)
+                        return Node_Ref is
+      Retval : Node_Ref;
+   begin
+      Retval := Pos * 2;
+      if (Retval > O.Count) then
+         return Null_Node;
+      else
+         return Retval;
+      end if;
+   end Left_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the right child of the given node.  Since the
+   -- heap is binary, we can multiply by two and add one.
+   function Right_Child (O   : in Object'Class;
+                         Pos : in Node_Ref)
+                         return Node_Ref is
+      Retval : Node_Ref;
+   begin
+      Retval := Pos * 2 + 1;
+      if (Retval > O.Count) then
+         return Null_Node;
+      else
+         return Retval;
+      end if;
+   end Right_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "left" of the given node.
+   function Left_Neighbor (O   : in Object'Class;
+                           Pos : in Node_Ref)
+                           return Node_Ref is
+   begin
+      if (Pos = 1) then
+         return Null_Node;
+      else
+         return Pos - 1;
+      end if;
+   end Left_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "right" of the given node.
+   function Right_Neighbor (O   : in Object'Class;
+                            Pos : in Node_Ref)
+                            return Node_Ref is
+   begin
+      if (Pos = O.Count) then
+         return Null_Node;
+      else
+         return Pos + 1;
+      end if;
+   end Right_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Add a new value into the last position in the heap.
+   procedure Add_New_Last (O   : in out Object'Class;
+                           Val : in Contained_Type) is
+   begin
+      if (O.Count = O.Data'Last) then
+         raise Container_Full;
+      end if;
+
+      O.Count := O.Count + 1;
+      O.Tail := O.Count;
+      if (O.Head = Null_Node) then
+         O.Head := O.Count;
+      end if;
+      O.Data(O.Tail).Val := Val;
+   end Add_New_Last;
+
+
+   ------------------------------------------------------------------------
+   -- Remove the tail value from the heap.  This routine should not be
+   -- called if the tail is at the top of the tree.
+   procedure Remove_Last (O : in out Object'Class) is
+   begin
+      O.Count := O.Count - 1;
+   end Remove_Last;
+--$END FIXED
+
+--$START EXPANDABLE
+   ------------------------------------------------------------------------
+   -- Expandable heaps are implemented as an array.  This make finding the
+   -- left and right neighbors easy, but it makes finding the children and
+   -- parents a little more complex.
+
+
+   ------------------------------------------------------------------------
+   -- Return the parent of the current node in the heap.  Since the heap is
+   -- binary, we can just divide by two.
+   function Parent (O   : in Object'Class;
+                    Pos : in Node_Ref)
+                    return Node_Ref is
+   begin
+      if (Pos = 1) then
+         return Null_Node;
+      else
+         return Pos / 2;
+      end if;
+   end Parent;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the left child of the given node.  Since the
+   -- heap is binary, we can multiply by two.
+   function Left_Child (O   : in Object'Class;
+                        Pos : in Node_Ref)
+                        return Node_Ref is
+      Retval : Node_Ref;
+   begin
+      Retval := Pos * 2;
+      if (Retval > O.Count) then
+         return Null_Node;
+      else
+         return Retval;
+      end if;
+   end Left_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is the right child of the given node.  Since the
+   -- heap is binary, we can multiply by two and add one.
+   function Right_Child (O   : in Object'Class;
+                         Pos : in Node_Ref)
+                         return Node_Ref is
+      Retval : Node_Ref;
+   begin
+      Retval := Pos * 2 + 1;
+      if (Retval > O.Count) then
+         return Null_Node;
+      else
+         return Retval;
+      end if;
+   end Right_Child;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "left" of the given node.
+   function Left_Neighbor (O   : in Object'Class;
+                           Pos : in Node_Ref)
+                           return Node_Ref is
+   begin
+      if (Pos = 1) then
+         return Null_Node;
+      else
+         return Pos - 1;
+      end if;
+   end Left_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Return the node that is to the "right" of the given node.
+   function Right_Neighbor (O   : in Object'Class;
+                            Pos : in Node_Ref)
+                            return Node_Ref is
+   begin
+      if (Pos = O.Count) then
+         return Null_Node;
+      else
+         return Pos + 1;
+      end if;
+   end Right_Neighbor;
+
+
+   ------------------------------------------------------------------------
+   -- Add a new value into the last position in the heap.
+   procedure Add_New_Last (O   : in out Object'Class;
+                           Val : in Contained_Type) is
+   begin
+      if (O.Count = O.Data'Last) then
+         -- The container is full, so extend it if we can.
+
+         if (O.Increment = 0) then
+            raise Container_Full;
+         end if;
+
+         declare
+            New_Val : Heap_Array_Ptr;
+         begin
+            New_Val := new Heap_Array(1 .. O.Count + O.Increment);
+            New_Val.all(1 .. O.Count) := O.Data.all;
+            Free_Heap_Array(O.Data);
+            O.Data := New_Val;
+         end;
+      end if;
+
+      O.Count := O.Count + 1;
+      O.Tail := O.Count;
+      if (O.Head = Null_Node) then
+         O.Head := O.Count;
+      end if;
+      O.Data(O.Tail).Val := Val;
+   end Add_New_Last;
+
+
+   ------------------------------------------------------------------------
+   -- Remove the tail value from the heap.  This routine should not be
+   -- called if the tail is at the top of the tree.
+   procedure Remove_Last (O : in out Object'Class) is
+   begin
+      O.Count := O.Count - 1;
+   end Remove_Last;
+--$END EXPANDABLE
+
+
+   ------------------------------------------------------------------------
+   -- Swap two values in the heap.  This will just swap the values in the
+   -- container.  Nodes must be writable and will point to the new
+   -- locations of the nodes in the heap.
+   procedure Swap (O     : in out Object'Class;
+                   Node1 : in out REF_VAL;
+                   Node2 : in out REF_VAL) is
+      Tmp_Val  : Contained_Type;
+      Tmp_Node : REF_VAL;
+   begin
+      Tmp_Val := REF(O, Node1).Val;
+      REF(O, Node1).Val := REF(O, Node2).Val;
+      REF(O, Node2).Val := Tmp_Val;
+      Tmp_Node := Node1;
+      Node1 := Node2;
+      Node2 := Tmp_Node;
+   end Swap;
+
+
+   ------------------------------------------------------------------------
+   -- Find the specified value in the heap.  This just does a linear search
+   -- from the first value.
+   function Find_Val (O   : in Object'Class;
+                      Val : in Contained_Type)
+                      return REF_VAL is
+      Retval : REF_VAL;
+   begin
+      Retval := O.Head;
+      while (Retval /= NULL_REF) loop
+         exit when (REF(O, Retval).Val = Val);
+
+         Retval := Right_Neighbor(O, Retval);
+      end loop;
+
+      return Retval;
+   end Find_Val;
+
+
+   ------------------------------------------------------------------------
+   -- Find the next position in the heap with the same value.  This just
+   -- does a linear search from the current value.
+   function Find_Val_Again (O    : in Object'Class;
+                            Curr : in REF_VAL)
+                            return REF_VAL is
+      Retval : REF_VAL;
+   begin
+      Retval := Right_Neighbor(O, Curr);
+      while (Retval /= NULL_REF) loop
+         exit when (REF(O, Retval).Val = REF(O, Curr).Val);
+
+         Retval := Right_Neighbor(O, Retval);
+      end loop;
+
+      return Retval;
+   end Find_Val_Again;
+
+
+   ------------------------------------------------------------------------
+   -- Delete a node in the graph.
+   procedure Delete_Node (O      : in out Object'Class;
+                          Del_Me : in REF_VAL) is
+      New_Tail : REF_VAL;
+      Curr     : REF_VAL;
+      Went_Up  : Boolean;
+      Left     : REF_VAL;
+      Right    : REF_VAL;
+      Up       : REF_VAL;
+      Node     : REF_VAL := Del_Me;
+   begin
+      New_Tail := Left_Neighbor(O, O.Tail);
+      if (New_Tail = NULL_REF) then
+         -- We are the only member of the heap, so just clear it.
+         if (O.Tail /= Node) then
+            raise Internal_Heap_Error;
+         end if;
+         O.Head := NULL_REF;
+         O.Tail := NULL_REF;
+         O.Count := 0;
+      elsif (Node = O.Tail) then
+         -- Deleting the tail value is easy.
+         Remove_Last(O);
+         O.Tail := New_Tail;
+      else
+         -- We are removing an intermediate node someplace.  Swap it with
+         -- the tail and then find the tail node's place.
+
+         Curr := O.Tail;
+
+         -- Swap the tail with the value to delete.
+         Swap(O, Curr, Node);
+
+         Remove_Last(O);
+         O.Tail := New_Tail;
+
+         -- Now do the swapping to put the old tail value (now in the heap
+         -- someplace else) in the proper place in the tree.
+
+         -- Move up while we can move up, swapping values as we go.
+         Went_Up := False;
+         Up := Parent(O, Curr);
+         while ((Up /= NULL_REF)
+                and then (REF(O, Up).Val < REF(O, Curr).Val))
+         loop
+            Went_Up := True;
+            Swap(O, Curr, Up);
+            Up := Parent(O, Curr);
+         end loop;
+
+         -- Now go down while we can go down, swapping values as we go, if
+         -- we didn't go up at all.
+         if (not Went_Up) then
+            loop
+               Left := Left_Child(O, Curr);
+               Right := Right_Child(O, Curr);
+               if ((Left /= NULL_REF) and (Right /= NULL_REF)) then
+                  -- A left and right child, so we need to figure out where
+                  -- to go down.
+                  if (REF(O, Left).Val > REF(O, Right).Val) then
+                     -- We always prefer moving up the larger value.
+                     if (REF(O, Left).Val > REF(O, Curr).Val) then
+                        Swap(O, Curr, Left);
+                     else
+                        -- Both values are greater than us, we are done.
+                        exit;
+                     end if;
+                  else
+                     -- We always prefer moving up the larger value.
+                     if (REF(O, Right).Val > REF(O, Curr).Val) then
+                        Swap(O, Curr, Right);
+                     else
+                        -- Both values are greater than us, we are done.
+                        exit;
+                     end if;
+                  end if;
+               elsif ((Left /= NULL_REF)
+                      and then (REF(O, Left).Val > REF(O, Curr).Val))
+               then
+                  -- No right reference, and the left reference is greater
+                  -- than is, so swap to the left.
+                  Swap(O, Curr, Left);
+               elsif ((Right /= NULL_REF)
+                      and then (REF(O, Right).Val > REF(O, Curr).Val))
+               then
+                  -- No left reference, and the left reference is greater
+                  -- than is, so swap to the left.
+                  Swap(O, Curr, Right);
+               else
+                  -- Either the node has no left or right reference or it
+                  -- has one child but the child is less than us.  We are
+                  -- done.
+                  exit;
+               end if;
+            end loop;
+         end if;
+      end if;
+
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Deleted(O.Cb, O, REF(O, Node).Val);
+      end if;
+--$START DYNAMIC
+
+      Free_Node(Node);
+--$END DYNAMIC
+   end Delete_Node;
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O   : in Object'Class;
+                          Val : in Contained_Type)
+                          return Natural is
+      Retval : Natural := 0;
+      Curr   : REF_VAL;
+   begin
+      Curr := Find_Val(O, Val);
+      while (Curr /= NULL_REF) loop
+         Retval := Retval + 1;
+         Curr := Find_Val_Again(O, Curr);
+      end loop;
+
+      return Retval;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   procedure Local_Add (O          : in out Object'Class;
+                        Val        : in Contained_Type;
+                        Added_Node : out REF_VAL) is
+      Up   : REF_VAL;
+      Node : REF_VAL;
+   begin
+      -- Add it at the end of the heap.
+      Add_New_Last(O, Val);
+
+      -- Now move it up in the heap while it is greater than the ones above
+      -- it.
+      Node := O.Tail;
+      Up := Parent(O, Node);
+      while ((Up /= NULL_REF)
+             and then (REF(O, Node).Val > REF(O, Up).Val))
+      loop
+         Swap(O, Node, Up);
+         Up := Parent(O, Node);
+      end loop;
+
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Added(O.Cb, O, REF(O, Node).Val);
+      end if;
+
+      Added_Node := Node;
+   end Local_Add;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+      null;
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+--$START DYNAMIC
+      Curr1    : Node_Ptr;
+      Curr2    : Node_Ptr;
+      Up1      : Node_Ptr;
+      Left1    : Node_Ptr;
+      Right1   : Node_Ptr;
+      New_Head : Node_Ptr;
+--$END DYNAMIC
+   begin
+--$START DYNAMIC
+      -- Do a pre-fix traversal of the tree, creating the new tree as we
+      -- traverse the old tree.
+      Curr1 := O.Head;
+      if (Curr1 /= null) then
+         -- Add the head node to the new tree.
+         New_Head := new Node;
+         REF(O, New_Head).Val := REF(O, Curr1).Val;
+         if (Curr1 = O.Tail) then
+            -- The only value in the tree, so the head is the tail.
+            O.Tail := New_Head;
+         end if;
+
+         if (O.Cb /= null) then
+            Copied(O.Cb, O, REF(O, New_Head).Val);
+         end if;
+
+         Curr2 := New_Head;
+         loop
+            -- A big nasty loop, but this continues the pre-fix traversal
+            -- creating nodes in the new tree as we visit them.
+            Left1 := Curr1.Left;
+            Right1 := Curr1.Right;
+            if (Left1 /= null) then
+               -- We are going down and the left tree wasn't null, so create
+               -- it in the new tree and move to it in both trees.
+               Curr1 := Left1;
+               Curr2.Left := new Node;
+               Curr2.Left.Up := Curr2;
+               Curr2 := Curr2.Left;
+               REF(O, Curr2).Val := REF(O, Curr1).Val;
+               if (Curr1 = O.Tail) then
+                  O.Tail := Curr2;
+               end if;
+               if (O.Cb /= null) then
+                  Copied(O.Cb, O, REF(O, Curr2).Val);
+               end if;
+            elsif (Right1 /= null) then
+               -- If the left branch is null, then the right branch in a
+               -- heap must be null.
+               raise Internal_Heap_Error;
+            else
+               -- We need to go up now, we've hit the bottom of the tree.
+               Up1 := Parent(O, Curr1);
+               while (Up1 /= null) loop
+                  Right1 := Up1.Right;
+                  Left1 := Up1.Left;
+                  if (Right1 = Curr1) then
+                     -- We moved up the right branch, so just keep moving
+                     -- up since we are done with the node.
+                     Curr1 := Up1;
+                     Curr2 := Curr2.Up;
+                     Up1 := Parent(O, Curr1);
+                  elsif (Left1 = Curr1) then
+                     -- We moved up a left branch.
+
+                     if (Right1 = null) then
+                        -- The right branch is null, so just keep moving up
+                        -- since we are done with the current node (no
+                        -- right branch needs to be added).
+                        Curr1 := Up1;
+                        Curr2 := Curr2.Up;
+                        Up1 := Parent(O, Curr1);
+                     else
+                        -- Add a new right branch and move down to it.
+                        Curr1 := Right1;
+                        Curr2.Up.Right := new Node;
+                        Curr2.Up.Right.Up := Curr2.Up;
+                        Curr2 := Curr2.Up.Right;
+                        REF(O, Curr2).Val := REF(O, Curr1).Val;
+                        if (Curr1 = O.Tail) then
+                           -- We added the tail node, so set the tail in
+                           -- the new heap.
+                           O.Tail := Curr2;
+                        end if;
+
+                        if (O.Cb /= null) then
+                           Copied(O.Cb, O, REF(O, Curr2).Val);
+                        end if;
+
+                        -- We are done moving up, we need to go down some
+                        -- more now.
+                        exit;
+                     end if;
+                  else
+                     -- Our parent didn't have us in its left or right
+                     -- child, something is wrong.
+                     raise Internal_Heap_Error;
+                  end if;
+               end loop;
+
+               -- We were moving up and we hit the top, so leave.
+               exit when (Up1 = null);
+            end if;
+         end loop;
+
+         O.Head := New_Head;
+      end if;
+--$END DYNAMIC
+--$START EXPANDABLE
+      -- Copy the data and call the Copied function for the new values, if
+      -- the callback is set.
+      O.Data := new Heap_Array'(O.Data.all);
+      if (O.Cb /= null) then
+         for I in 1 .. O.Count loop
+            Copied(O.Cb, O, O.Data(I).Val);
+         end loop;
+      end if;
+--$END EXPANDABLE
+--$START FIXED
+      -- Call the Copied function for the new values, if the callback is
+      -- set.
+      if (O.Cb /= null) then
+         for I in 1 .. O.Count loop
+            Copied(O.Cb, O, O.Data(I).Val);
+         end loop;
+      end if;
+--$END FIXED
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+--$START DYNAMIC
+      Curr : Node_Ptr;
+      Tmp  : Node_Ptr;
+--$END DYNAMIC
+   begin
+--$START DYNAMIC
+      -- Do a post-fix traversal of the tree, deleting nodes as we visit
+      -- them.
+      Curr := O.Head;
+      while (Curr /= null) loop
+         if (Curr.Left /= null) then
+            -- Move down to the left.
+            Curr := Curr.Left;
+         elsif (Curr.Right /= null) then
+            -- This can occur when we are deleting because we delete the
+            -- left node first.
+            Curr := Curr.Right;
+         else
+            -- We've hit the bottom of the tree.
+            if (Curr.Up /= null) then
+
+               -- Break off the branch we are about to move up.
+               if (Curr.Up.Left = Curr) then
+                  Curr.Up.Left := null;
+               elsif (Curr.Up.Right = Curr) then
+                  Curr.Up.Right := null;
+               else
+                  -- Our parent did not have us as a child, bad news.
+                  raise Internal_Heap_Error;
+               end if;
+            end if;
+
+            Tmp := Curr;
+            Curr := Curr.Up;
+
+            if (O.Cb /= null) then
+               Deleted(O.Cb, O, REF(O, Tmp).Val);
+            end if;
+
+            Free_Node(Tmp);
+         end if;
+      end loop;
+--$END DYNAMIC
+--$START EXPANDABLE
+      -- Call the deleted function for all elements of the heap, then free
+      -- the allocated data.
+      if (O.Cb /= null) then
+         for I in 1 .. O.Count loop
+            Deleted(O.Cb, O, O.Data(I).Val);
+         end loop;
+      end if;
+      Free_Heap_Array(O.Data);
+--$END EXPANDABLE
+--$START FIXED
+      -- Call the deleted function for all elements of the heap.
+      if (O.Cb /= null) then
+         for I in 1 .. O.Count loop
+            Deleted(O.Cb, O, O.Data(I).Val);
+         end loop;
+      end if;
+--$END FIXED
+
+      O.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Add (O   : in out Object;
+                  Val : in Contained_Type) is
+      Node : REF_VAL;
+   begin
+      Check_Object(O);
+
+      Local_Add(O, Val, Node);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      To_Delete : REF_VAL;
+   begin
+      Check_Object(O);
+
+      To_Delete := Find_Val(O, Val);
+      if (To_Delete = NULL_REF) then
+         raise Item_Not_Found;
+      else
+         Delete_Node(O, To_Delete);
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+   begin
+      Check_Object(O);
+
+      return (Find_Val(O, Val) /= NULL_REF);
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object)
+                          return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+      Curr1  : REF_VAL;
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Count /= O2.Count) then
+         return False;
+      else
+         -- This function will return True if when we remove each item
+         -- from the top of the heap we will get the same sequence of
+         -- items.  The actual tree structure may not be exactly the
+         -- same, but that shouldn't matter.
+
+         -- This works by verifying that for each member of O1, O2 has the
+         -- same number of members of that value.  This is quite slow, but
+         -- accurate.
+
+         Curr1 := O1.Head;
+         while (Curr1 /= NULL_REF) loop
+            if (Member_Count(O1, REF(O1, Curr1).Val)
+                /= Member_Count(O2, REF(O1, Curr1).Val))
+            then
+               return False;
+            end if;
+
+            Curr1 := Right_Neighbor(O1, Curr1);
+         end loop;
+
+         return True;
+      end if;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      Curr  : REF_VAL;
+      Up    : REF_VAL;
+      Left  : REF_VAL;
+      Right : REF_VAL;
+      Count : Natural := 0;
+      Depth : Natural := 1;
+
+      Max_Depth : Natural := 0;
+      Tail      : REF_VAL;
+   begin
+      Check_Object(O);
+
+      -- Do an in-order traversal of the tree, checking each node as we
+      -- come to it.
+      Curr := O.Head;
+
+      if (Curr = NULL_REF) then
+         if (O.Tail /= NULL_REF) then
+            raise Internal_Heap_Error;
+         end if;
+      else
+         loop
+            -- Count the members.
+            Count := Count + 1;
+
+            -- Make sure that the children point back up to their parents.
+            Left := Left_Child(O, Curr);
+            Right := Right_Child(O, Curr);
+            if (Left /= NULL_REF) then
+               if (Parent(O, Left) /= Curr) then
+                  raise Internal_Heap_Error;
+               end if;
+               if (REF(O, Left).Val > REF(O, Curr).Val) then
+                  raise Internal_Heap_Error;
+               end if;
+            end if;
+
+            if (Right /= NULL_REF) then
+               if (Parent(O, Right) /= Curr) then
+                  raise Internal_Heap_Error;
+               end if;
+               if (REF(O, Right).Val > REF(O, Curr).Val) then
+                  raise Internal_Heap_Error;
+               end if;
+            end if;
+
+            if (Left /= NULL_REF) then
+               Curr := Left;
+               Depth := Depth + 1;
+            elsif (Right /= NULL_REF) then
+               Curr := Right;
+               Depth := Depth + 1;
+            else
+               -- We are at a leaf.  First check the depth, then move to
+               -- the next item in the tree.
+
+               -- The current depth may either be the max depth (the last
+               -- one at that depth should be the tail) or one less than
+               -- the max depth.
+               if (Max_Depth = 0) then
+                  Tail := Curr;
+                  Max_Depth := Depth;
+               elsif (Depth = Max_Depth) then
+                  Tail := Curr;
+               elsif (Max_Depth /= (Depth + 1)) then
+                     raise Internal_Heap_Error;
+               end if;
+
+               Up := Parent(O, Curr);
+               while (Up /= NULL_REF) loop
+                  Right := Right_Child(O, Up);
+                  Left := Left_Child(O, Up);
+                  if (Right = Curr) then
+                     Curr := Up;
+                     Up := Parent(O, Curr);
+                     Depth := Depth - 1;
+                  elsif (Left = Curr) then
+                     if (Right = NULL_REF) then
+                        Curr := Up;
+                        Up := Parent(O, Curr);
+                        Depth := Depth - 1;
+                     else
+                        Curr := Right;
+                        exit;
+                     end if;
+                  else
+                     raise Internal_Heap_Error;
+                  end if;
+               end loop;
+
+               exit when (Up = NULL_REF);
+            end if;
+         end loop;
+
+         if (Tail /= O.Tail) then
+            raise Internal_Heap_Error;
+         end if;
+      end if;
+
+      if (Count /= O.Count) then
+         raise Internal_Heap_Error;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval : Object_Ptr;
+   begin
+--$START DYNAMIC
+      Retval := new Object;
+--$END DYNAMIC
+--$START FIXED
+      Retval := new Object(Size => O.Size);
+--$END FIXED
+--$START EXPANDABLE
+      Retval := new Object(Initial_Size => O.Initial_Size,
+                           Increment    => O.Increment);
+--$END EXPANDABLE
+      -- Let Adjust() take care of the data copy.
+      Retval.all := O;
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   function Get_Head (O : in Object)
+                      return Contained_Type is
+   begin
+      Check_Object(O);
+
+      if (O.Head = NULL_REF) then
+         raise Item_Not_Found;
+      else
+         return REF(O, O.Head).Val;
+      end if;
+   end Get_Head;
+
+
+   ------------------------------------------------------------------------
+   procedure Remove_Head (O   : in out Object;
+                          Val : out Contained_Type) is
+   begin
+      Check_Object(O);
+
+      if (O.Head = NULL_REF) then
+         raise Item_Not_Found;
+      else
+         Val := REF(O, O.Head).Val;
+         Delete_Node(O, O.Head);
+      end if;
+   end Remove_Head;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := Invalid_Update;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Add(Iter.Robj.all, Val, Iter.Pos);
+      Iter.Update := Iter.Robj.Update;
+   end Add;
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Iter.Pos := Iter.Robj.Head;
+      Iter.Update := Iter.Robj.Update;
+      if (Iter.Pos = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+      New_Pos : REF_VAL;
+   begin
+      Check_Iterator(Iter);
+
+      New_Pos := Right_Neighbor(Iter.Robj.all, Iter.Pos);
+      if (New_Pos = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Iter.Pos := New_Pos;
+         Is_End := Not_Past_End;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      -- We don't move the actual nodes around in the heap, only the
+      -- values, so the position should still be valid after a delete.
+      if (Iter.Pos = Iter.Robj.Tail) then
+         Delete_Node(Iter.Robj.all, Iter.Pos);
+         Is_End := Past_End;
+      else
+         Delete_Node(Iter.Robj.all, Iter.Pos);
+         Is_End := Not_Past_End;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      return (Iter1.Pos = Iter2.Pos);
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return REF(Iter.Robj.all, Iter.Pos).Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Val := REF(Iter.Robj.all, Iter.Pos).Val;
+      Next(Iter, Is_End);
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj.all, Iter1.Pos).Val
+              = REF(Iter2.Robj.all, Iter2.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj.all, Iter.Pos).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val = REF(Iter.Robj.all, Iter.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   procedure Search (Iter  : in out Iterator;
+                     Val   : in Contained_Type;
+                     Found : out Boolean) is
+      New_Pos : REF_VAL;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      New_Pos := Find_Val(Iter.Robj.all, Val);
+      if (New_Pos = NULL_REF) then
+         Found := False;
+      else
+         Found := True;
+         Iter.Pos := New_Pos;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Search;
+
+end Asgc.Heap.CTYPEMANAGED;

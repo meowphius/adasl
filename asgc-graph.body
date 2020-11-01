@@ -1,0 +1,1565 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Graph.CTYPE.GRAPHTYPEMANAGED is
+
+--$START DYNAMIC
+   procedure Free_Node is new Ada.Unchecked_Deallocation (Node, Node_Ptr);
+--$END DYNAMIC
+--$START EXPANDABLE
+   procedure Free_Node_Array is new Ada.Unchecked_Deallocation
+     (Node_Array, Node_Array_Ptr);
+--$END EXPANDABLE
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_No_Pos (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+   end Check_Iterator_No_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Find the node in the graph that holds the specified value and return
+   -- its reference.
+   function Find_Member (O     : in Object'Class;
+                         Val   : in Contained_Type)
+                         return REF_VAL is
+      Curr     : REF_VAL;
+      Hash_Val : Positive;
+   begin
+      Hash_Val := (Do_Hash(Val) mod O.Hash_Size) + 1;
+      Curr := O.Nodes(Hash_Val);
+      while ((Curr /= NULL_REF)
+             and then (REF(O, Curr).Val /= Val))
+      loop
+         Curr := REF(O, Curr).Next;
+      end loop;
+
+      return Curr;
+   end Find_Member;
+
+
+--$START DYNAMIC
+   ------------------------------------------------------------------------
+   -- Return a reference to the member, but we are operating on a hash
+   -- array, not a whole object.
+   function Find_Member (Nodes : in Hash_Array;
+                         Val   : in Contained_Type)
+                         return Node_Ptr is
+      Curr     : Node_Ptr;
+      Hash_Val : Positive;
+   begin
+      Hash_Val := (Do_Hash(Val) mod Nodes'Last) + 1;
+      Curr := Nodes(Hash_Val);
+      while ((Curr /= null)
+             and then (Curr.Val /= Val))
+      loop
+         Curr := Curr.Next;
+      end loop;
+
+      return Curr;
+   end Find_Member;
+
+
+   ------------------------------------------------------------------------
+   -- Make a complete copy of all the nodes in the graph, recreating the
+   -- full link structure.
+   procedure Copy_Nodes (Dest   : in out Hash_Array;
+                         Source : in Hash_Array) is
+      Curr_Src : Node_Ptr;
+      Curr_Dst : Node_Ptr;
+      Iter     : Link_List_It;
+      Is_End   : End_Marker;
+      To_Add   : Node_Ptr;
+      Old_Node : Node_Ptr;
+   begin
+      -- First recreate the initial graph nodes, but don't add any links
+      -- yet.  This next pass over the data structure takes care of that.
+      for I in Source'Range loop
+         if (Source(I) /= null) then
+            Dest(I) := new Node;
+            Dest(I).Val := Source(I).Val;
+            Curr_Src := Source(I).Next;
+            Curr_Dst := Dest(I);
+            while (Curr_Src /= null) loop
+               Curr_Dst.Next := new Node;
+               Curr_Dst.Next.Prev := Curr_Dst;
+               Curr_Dst.Next.Val := Curr_Src.Val;
+               Curr_Src := Curr_Src.Next;
+               Curr_Dst := Curr_Dst.Next;
+            end loop;
+         end if;
+      end loop;
+
+      -- Now recreate the links in the graph.
+      for I in Source'Range loop
+         Curr_Src := Source(I);
+         Curr_Dst := Dest(I);
+         while (Curr_Src /= null) loop
+            -- Go through all the links the current node references, find
+            -- the new reference, and recreate the link in the new graph.
+            Links.Set_Node(Graph_Link_It'Class(Iter),
+                           Curr_Src.Links'Access);
+            Links.First(Graph_Link_It'Class(Iter), Is_End);
+            while (Is_End = Not_Past_End) loop
+               Old_Node := Node_Ptr(Links.Get(Graph_Link_It'Class(Iter)));
+               To_Add := Find_Member(Dest, Old_Node.Val);
+               Links.Add(Graph_Link'Class(Curr_Dst.Links),
+                         REF_BASE(To_Add),
+                         Links.Get_Contents(Graph_Link_It'Class(Iter)));
+               Links.Next(Graph_Link_It'Class(Iter), Is_End);
+            end loop;
+
+--$START DIGRAPH
+            -- Directed graphs need to have all their from links (links
+            -- back to nodes that reference them) set up.
+            Links.Set_Node(Graph_Link_It'Class(Iter),
+                           Curr_Src.From_Links'Access);
+            Links.First(Graph_Link_It'Class(Iter), Is_End);
+            while (Is_End = Not_Past_End) loop
+               Old_Node := Node_Ptr(Links.Get(Graph_Link_It'Class(Iter)));
+               To_Add := Find_Member(Dest, Old_Node.Val);
+               Links.Add(Graph_Link'Class(Curr_Dst.From_Links),
+                         REF_BASE(To_Add),
+                         Links.Get_Contents(Graph_Link_It'Class(Iter)));
+               Links.Next(Graph_Link_It'Class(Iter), Is_End);
+            end loop;
+--$END DIGRAPH
+            Curr_Src := Curr_Src.Next;
+            Curr_Dst := Curr_Dst.Next;
+         end loop;
+      end loop;
+   end Copy_Nodes;
+--$END DYNAMIC
+
+
+   ------------------------------------------------------------------------
+   -- Delete the references value from the graph.  This will delete the
+   -- node from the hash table and will delete all the links to other
+   -- graph nodes and all the links back from those nodes.
+   procedure Internal_Delete (O    : in out Object'Class;
+                              Curr : in out REF_VAL) is
+      ONode      : REF_VAL;
+      Hash_Val   : Positive;
+      Next_Node  : REF_VAL;
+      Link_Count : Natural;
+      Link_Val   : Link_Contained_Type;
+   begin
+      Hash_Val := (Do_Hash(REF(O, Curr).Val) mod O.Hash_Size) + 1;
+
+      -- Remove the item from the hash table.
+      if (Curr = O.Nodes(Hash_Val)) then
+         O.Nodes(Hash_Val) := REF(O, Curr).Next;
+         if (O.Nodes(Hash_Val) /= NULL_REF) then
+            Next_Node := O.Nodes(Hash_Val);
+            REF(O, Next_Node).Prev := NULL_REF;
+         end if;
+      else
+         REF(O, REF(O, Curr).Prev).Next := REF(O, Curr).Next;
+         if (REF(O, Curr).Next /= NULL_REF) then
+            REF(O, REF(O, Curr).Next).Prev := REF(O, Curr).Prev;
+         end if;
+      end if;
+
+      -- Now delete all the links to this item.  We simply follow all the
+      -- links and delete all the links back, since links will go in both
+      -- directions.
+      Link_Count := Links.Link_Count(Graph_Link'Class(REF(O, Curr).Links));
+      for I in 1 .. Link_Count loop
+         ONode := REF_VAL
+                    (Links.Get_Pos(Graph_Link'Class(REF(O, Curr).Links), 1));
+
+         if (O.Link_Cb /= null) then
+            -- Call the callback for the link.
+            Link_Val := Links.Get_First_Contents
+                          (Graph_Link'Class(REF(O, Curr).Links));
+            Deleted(O.Link_Cb, O, Link_Val);
+--$START GRAPH
+            -- Get the link value from the reverse link and call the
+            -- callback.
+            Link_Val := Links.Get_Contents
+                          (Graph_Link'Class(REF(O, ONode).Links),
+                           REF_BASE(Curr));
+            Deleted(O.Link_Cb, O, Link_Val);
+--$END GRAPH
+         end if;
+
+         Links.Delete_First(Graph_Link'Class(REF(O, Curr).Links));
+--$START GRAPH
+         Links.Delete_Val(Graph_Link'Class(REF(O, ONode).Links),
+                          REF_BASE(Curr));
+--$END GRAPH
+--$START DIGRAPH
+         Links.Delete_Val(Graph_Link'Class(REF(O, ONode).From_Links),
+                          REF_BASE(Curr));
+--$END DIGRAPH
+      end loop;
+
+--$START DIGRAPH
+      -- Now delete all the From links in the node, deleting the links
+      -- to this node in the process.
+      Link_Count := Links.Link_Count
+                     (Graph_Link'Class(REF(O, Curr).From_Links));
+      for I in 1 .. Link_Count loop
+         ONode := REF_VAL
+           (Links.Get_Pos(Graph_Link'Class(REF(O, Curr).From_Links), 1));
+         Links.Delete_First(Graph_Link'Class(REF(O, Curr).From_Links));
+
+         -- Delete the link back, but call the callback for it.
+         Link_Val := Links.Get_Contents(Graph_Link'Class(REF(O, ONode).Links),
+                                        REF_BASE(Curr));
+         Deleted(O.Link_Cb, O, Link_Val);
+         Links.Delete_Val(Graph_Link'Class(REF(O, ONode).Links),
+                          REF_BASE(Curr));
+      end loop;
+--$END DIGRAPH
+
+      O.Count := O.Count - 1;
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Deleted(O.Cb, O, REF(O, Curr).Val);
+      end if;
+
+      -- Now free the deleted node.
+--$START DYNAMIC
+      Links.Free_Graph_Link(Graph_Link'Class(REF(O, Curr).Links));
+--$START DIGRAPH
+      Links.Free_Graph_Link(Graph_Link'Class(REF(O, Curr).From_Links));
+--$END DIGRAPH
+      Free_Node(Curr);
+--$END DYNAMIC
+--$START FIXED
+      REF(O, Curr).Next := O.Free_List;
+      O.Free_List := Curr;
+--$END FIXED
+--$START EXPANDABLE
+      REF(O, Curr).Next := O.Free_List;
+      O.Free_List := Curr;
+--$END EXPANDABLE
+   end Internal_Delete;
+
+   ------------------------------------------------------------------------
+   -- Call the copied function for all values in the object if the
+   -- appropriate callback is set.
+   procedure Call_Copied_All (O : in out Object'Class) is
+      Curr     : REF_VAL;
+      Iter     : Link_List_It;
+      Link_Val : Link_Contained_Type;
+      Is_End   : End_Marker;
+   begin
+      -- Tell all the graph links they were copied.
+--$START DYNAMIC
+      -- For dynamic graphs the graph link copied routines are not called
+      -- because they are added by Copy_Nodes, not copied.  Copies don't
+      -- work because it holds pointers to graph nodes.
+--$END DYNAMIC
+--$START FIXED
+      for I in O.Data'Range loop
+         Links.Copied_Graph_Link(Graph_Link'Class(O.Data(I).Links));
+--$START DIGRAPH
+         Links.Copied_Graph_Link(Graph_Link'Class(O.Data(I).From_Links));
+--$END DIGRAPH
+      end loop;
+--$END FIXED
+--$START EXPANDABLE
+      for I in O.Data'Range loop
+         Links.Copied_Graph_Link(Graph_Link'Class(O.Data(I).Links));
+--$START DIGRAPH
+         Links.Copied_Graph_Link(Graph_Link'Class(O.Data(I).From_Links));
+--$END DIGRAPH
+      end loop;
+--$END EXPANDABLE
+
+      if (O.Cb /= null) then
+         -- Call the main node callback for all the nodes in the graph.
+         for I in O.Nodes'Range loop
+            Curr := O.Nodes(I);
+            while (Curr /= NULL_REF) loop
+               Copied(O.Cb, O, REF(O, Curr).Val);
+               Curr := REF(O, Curr).Next;
+            end loop;
+         end loop;
+      end if;
+
+      if (O.Link_Cb /= null) then
+         -- Call the link callback for all the links in the list.
+         for I in O.Nodes'Range loop
+            Curr := O.Nodes(I);
+            while (Curr /= NULL_REF) loop
+               Links.Set_Node(Graph_Link_It'Class(Iter),
+                              REF(O, Curr).Links'Unchecked_Access);
+               Links.First(Graph_Link_It'Class(Iter), Is_End);
+               while (Is_End = Not_Past_End) loop
+                  -- Fixme -- Since the user is allowed to modify the
+                  -- contained value, we have to get it, call the callback,
+                  -- and set it.  This is rather inefficient.
+                  Link_Val := Links.Get_Contents
+                                (Graph_Link_It'Class(Iter));
+                  Copied(O.Link_Cb, O, Link_Val);
+                  Links.Set_Contents(Graph_Link_It'Class(Iter),
+                                     Link_Val);
+                  Links.Next(Graph_Link_It'Class(Iter), Is_End);
+               end loop;
+
+               Curr := REF(O, Curr).Next;
+            end loop;
+         end loop;
+      end if;
+   end Call_Copied_All;
+
+
+   ------------------------------------------------------------------------
+   procedure Internal_Add_Link (O          : in out Object'Class;
+                                From       : in REF_VAL;
+                                To         : in REF_VAL;
+                                Contents   : in Link_Contained_Type;
+                                Ignore_Dup : in Boolean) is
+      Local_Val1 : Link_Contained_Type := Contents;
+      Local_Val2 : Link_Contained_Type := Contents;
+   begin
+      if ((not Allow_Duplicate_Links) and then
+          Links.Val_Exists(Graph_Link'Class(REF(O, From).Links),
+                           REF_BASE(To)))
+      then
+         if (not Ignore_Dup) then
+            raise Item_Already_Exists;
+         end if;
+      else
+         -- Add the link each direction.
+         if (O.Link_Cb /= null) then
+            Added(O.Link_Cb, O, Local_Val1);
+         end if;
+         Links.Add(Graph_Link'Class(REF(O, From).Links),
+                   REF_BASE(To),
+                   Local_Val1);
+
+         begin
+--$START GRAPH
+            if (O.Link_Cb /= null) then
+               -- We add the link here.  If the code raises an exception,
+               -- we don't want the graph to be insane, so we call deleted
+               -- on the added value.
+               begin
+                  Added(O.Link_Cb, O, Local_Val2);
+               exception
+                  when others =>
+                     Deleted(O.Link_Cb, O, Local_Val1);
+                     raise;
+               end;
+            end if;
+            Links.Add(Graph_Link'Class(REF(O, To).Links),
+                      REF_BASE(From),
+                      Local_Val2);
+--$END GRAPH
+--$START DIGRAPH
+            Links.Add(Graph_Link'Class(REF(O, To).From_Links),
+                      REF_BASE(From),
+                      Local_Val2);
+--$END DIGRAPH
+         exception
+            when others =>
+               -- If we get an exception here, we need to remove the link
+               -- we previously added so the container remains sane.
+               Links.Delete_Val
+                 (Graph_Link'Class(REF(O, From).Links),
+                  REF_BASE(To));
+               raise;
+         end;
+      end if;
+   end Internal_Add_Link;
+
+
+   ------------------------------------------------------------------------
+   -- Add an item to the container and return a reference to the added
+   -- item.
+   procedure Local_Add (O          : in out Object'Class;
+                        Val        : in Contained_Type;
+                        Added_Node : out REF_VAL) is
+      New_Node  : REF_VAL;
+      Next_Node : REF_VAL;
+      Hash_Val  : Positive;
+--$START EXPANDABLE
+      Prev_Last : Positive;
+--$END EXPANDABLE
+   begin
+      if (Find_Member(O, Val) /= NULL_REF) then
+         raise Item_Already_Exists;
+      end if;
+
+      Hash_Val := (Do_Hash(Val) mod O.Hash_Size) + 1;
+
+--$START DYNAMIC
+      New_Node := new Node;
+--$END DYNAMIC
+--$START FIXED
+      New_Node := O.Free_List;
+      if (New_Node = NULL_REF) then
+         raise Container_Full;
+      end if;
+      O.Free_List := REF(O, New_Node).Next;
+--$END FIXED
+--$START EXPANDABLE
+      if (O.Free_List = NULL_REF) then
+         if (O.Increment = 0) then
+            raise Container_Full;
+         end if;
+
+         Prev_Last := O.Data'Last;
+         declare
+            New_Array : Node_Array_Ptr
+              := new Node_Array(1 .. Prev_Last + O.Increment);
+         begin
+            New_Array.all(1 .. Prev_Last) := O.Data.all;
+            Free_Node_Array(O.Data);
+            O.Data := New_Array;
+            for I in (Prev_Last + 1) .. New_Array.all'Last loop
+               REF(O, I).Next := O.Free_List;
+               O.Free_List := I;
+            end loop;
+         end;
+      end if;
+      New_Node := O.Free_List;
+      O.Free_List := REF(O, New_Node).Next;
+--$END EXPANDABLE
+      REF(O, New_Node).Val := Val;
+      REF(O, New_Node).Next := O.Nodes(Hash_Val);
+      REF(O, New_Node).Prev := NULL_REF;
+      if (O.Nodes(Hash_Val) /= NULL_REF) then
+         Next_Node := O.Nodes(Hash_Val);
+         REF(O, Next_Node).Prev := New_Node;
+      end if;
+      O.Nodes(Hash_Val) := New_Node;
+      O.Count := O.Count + 1;
+      O.Update := O.Update + 1;
+      if (O.Cb /= null) then
+         Added(O.Cb, O, REF(O, New_Node).Val);
+      end if;
+
+      Added_Node := New_Node;
+   end Local_Add;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+--$START DYNAMIC
+      null;
+--$END DYNAMIC
+--$START FIXED
+      for I in O.Data'Range loop
+         REF(O, I).Next := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END FIXED
+--$START EXPANDABLE
+      for I in O.Data'Range loop
+         REF(O, I).Next := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END EXPANDABLE
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+--$START DYNAMIC
+      Tmp      : Hash_Array(1 .. O.Hash_Size);
+--$END DYNAMIC
+   begin
+--$START DYNAMIC
+      Tmp := O.Nodes;
+      Copy_Nodes(O.Nodes, Tmp);
+--$END DYNAMIC
+--$START EXPANDABLE
+      O.Data := new Node_Array'(O.Data.all);
+--$END EXPANDABLE
+
+      Call_Copied_All(O);
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+      Curr     : REF_VAL;
+      Next     : REF_VAL;
+      Iter     : Link_List_It;
+      Link_Val : Link_Contained_Type;
+      Is_End   : End_Marker;
+   begin
+      for I in O.Nodes'Range loop
+         Curr := O.Nodes(I);
+         while (Curr /= NULL_REF) loop
+            Next := REF(O, Curr).Next;
+
+            if (O.Link_Cb /= null) then
+               -- Call the callback for all the links in the node.
+               Links.Set_Node(Graph_Link_It'Class(Iter),
+                              REF(O, Curr).Links'Unchecked_Access);
+               Links.First(Graph_Link_It'Class(Iter), Is_End);
+               while (Is_End = Not_Past_End) loop
+                  -- Fixme -- Since the user is allowed to modify the
+                  -- contained value, we have to get it call the callback.
+                  -- This is rather inefficient.  However, we don't have
+                  -- to put the value back, so it's not too bad.
+                  Link_Val := Links.Get_Contents(Graph_Link_It'Class(Iter));
+                  Deleted(O.Link_Cb, O, Link_Val);
+
+                  Links.Next(Graph_Link_It'Class(Iter), Is_End);
+               end loop;
+            end if;
+
+            if (O.Cb /= null) then
+               Deleted(O.Cb, O, REF(O, Curr).Val);
+            end if;
+
+--$START DYNAMIC
+            Links.Free_Graph_Link(Graph_Link'Class(REF(O, Curr).Links));
+--$START DIGRAPH
+            Links.Free_Graph_Link(Graph_Link'Class(REF(O, Curr).From_Links));
+--$END DIGRAPH
+            Free_Node(Curr);
+--$END DYNAMIC
+            Curr := Next;
+         end loop;
+      end loop;
+
+--$START FIXED
+      -- Free all the graph links.
+      for I in O.Data'Range loop
+         Links.Free_Graph_Link(Graph_Link'Class(O.Data(I).Links));
+--$START DIGRAPH
+         Links.Free_Graph_Link(Graph_Link'Class(O.Data(I).From_Links));
+--$END DIGRAPH
+      end loop;
+--$END FIXED
+--$START EXPANDABLE
+      -- Free all the graph links.
+      for I in O.Data'Range loop
+         Links.Free_Graph_Link(Graph_Link'Class(O.Data(I).Links));
+--$START DIGRAPH
+         Links.Free_Graph_Link(Graph_Link'Class(O.Data(I).From_Links));
+--$END DIGRAPH
+      end loop;
+      Free_Node_Array(O.Data);
+--$END EXPANDABLE
+
+      O.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Add (O   : in out Object;
+                  Val : in Contained_Type) is
+      New_Node  : REF_VAL;
+   begin
+      Check_Object(O);
+
+      Local_Add(O, Val, New_Node);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval   : Object_Class;
+   begin
+--$START DYNAMIC
+      Retval := new Object(Hash_Size => O.Hash_Size);
+      Copy_Nodes(Retval.Nodes, O.Nodes);
+      Retval.Count := O.Count;
+      Retval.Cb := O.Cb;
+--$END DYNAMIC
+--$START FIXED
+      Retval := new Object'(O);
+--$END FIXED
+--$START EXPANDABLE
+      Retval := new Object'(O);
+      Retval.Data := new Node_Array'(Retval.Data.all);
+--$END EXPANDABLE
+
+      Call_Copied_All(Retval.all);
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      To_Delete : REF_VAL;
+   begin
+      Check_Object(O);
+
+      To_Delete := Find_Member(O, Val);
+      if (To_Delete = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Internal_Delete(O, To_Delete);
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+   begin
+      Check_Object(O);
+
+      return (Find_Member(O, Val) /= NULL_REF);
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object) return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      Count      : Natural := 0;
+      Curr       : REF_VAL;
+      ONode      : REF_VAL;
+      Instance   : Natural;
+      Link_Count : Natural;
+   begin
+      Check_Object(O);
+
+      -- For every node, make sure that every node I point to has a
+      -- reference back to me.
+      for I in O.Nodes'Range loop
+         Curr := O.Nodes(I);
+         while (Curr /= NULL_REF) loop
+            if (((Do_Hash(REF(O, Curr).Val) mod O.Hash_Size) + 1) /= I) then
+               raise Internal_Graph_Error;
+            end if;
+
+            if ((REF(O, Curr).Next /= NULL_REF)
+                and then (REF(O, REF(O, Curr).Next).Prev /= Curr))
+            then
+               raise Internal_Graph_Error;
+            end if;
+
+            Link_Count := Links.Link_Count
+                           (Graph_Link'Class(REF(O, Curr).Links));
+            for I in 1 .. Link_Count loop
+               ONode := REF_VAL
+                 (Links.Get_Pos(Graph_Link'Class(REF(O, Curr).Links),
+                                I));
+
+               -- If I am the the Nth instance, the link back to me should
+               -- also be the Nth instance.
+               Instance := Links.Get_Instance_Number
+                             (Graph_Link'Class(REF(O, Curr).Links),
+                              I);
+--$START GRAPH
+               if (not Links.Val_Exists
+                        (Graph_Link'Class(REF(O, ONode).Links),
+                         REF_BASE(Curr),
+                         Instance))
+--$END GRAPH
+--$START DIGRAPH
+               if (not Links.Val_Exists
+                        (Graph_Link'Class(REF(O, ONode).From_Links),
+                         REF_BASE(Curr),
+                         Instance))
+--$END DIGRAPH
+               then
+                  raise Internal_Graph_Error;
+               end if;
+            end loop;
+
+            Curr := REF(O, Curr).Next;
+            Count := Count + 1;
+         end loop;
+      end loop;
+
+      if (Count /= O.Count) then
+         raise Internal_Graph_Error;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Link (O          : in out Object;
+                       From       : in Contained_Type;
+                       To         : in Contained_Type;
+                       Contents   : in Link_Contained_Type;
+                       Ignore_Dup : in Boolean      := True) is
+      From_Curr  : REF_VAL;
+      To_Curr    : REF_VAL;
+   begin
+      Check_Object(O);
+
+      From_Curr := Find_Member(O, From);
+      if (From_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+      To_Curr := Find_Member(O, To);
+      if (To_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Internal_Add_Link(O, From_Curr, To_Curr, Contents, Ignore_Dup);
+   end Add_Link;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+      Curr1      : REF_VAL;
+      Curr2      : REF_VAL;
+      ONode1     : REF_VAL;
+      ONode2     : REF_VAL;
+      Link_Count : Natural;
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Count /= O2.Count) then
+         return False;
+      else
+         -- Go through each node in O1, find the corresponding value in
+         -- O2, and for every link in a node in O1 verify that there is
+         -- a link from the O2 node to a node with the same value as the
+         -- O1 link.
+         for I in O1.Nodes'Range loop
+            Curr1 := O1.Nodes(I);
+            while (Curr1 /= NULL_REF) loop
+               Curr2 := Find_Member(O2, REF(O1, Curr1).Val);
+               if (Curr2 = NULL_REF) then
+                  return False;
+               end if;
+
+               if (Links.Link_Count(Graph_Link'Class(REF(O1, Curr1).Links))
+                   /= Links.Link_Count(Graph_Link'Class(REF(O2, Curr2).Links)))
+               then
+                  return False;
+               end if;
+
+               Link_Count := Links.Link_Count
+                               (Graph_Link'Class(REF(O1, Curr1).Links));
+               for I in 1 .. Link_Count loop
+                  ONode1 := REF_VAL
+                    (Links.Get_Pos(Graph_Link'Class
+                                   (REF(O1, Curr1).Links),
+                                   I));
+
+                  ONode2 := Find_Member(O2, REF(O1, Onode1).Val);
+                  if (ONode2 = NULL_REF) then
+                     return False;
+                  end if;
+
+                  if (not Links.Val_Exists
+                           (Graph_Link'Class(REF(O2, Curr2).Links),
+                            REF_BASE(ONode2)))
+                  then
+                     return False;
+                  end if;
+               end loop;
+
+               Curr1 := REF(O1, Curr1).Next;
+            end loop;
+         end loop;
+
+         return True;
+      end if;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Add(Iter.Robj.all, Val, Iter.Curr);
+      Links.Set_Node(Graph_Link_It'Class(Iter.Links_It),
+                     REF(Iter.Robj, Iter.Curr).Links'Access);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Search (Iter  : in out Iterator;
+                     Val   : in Contained_Type;
+                     Found : out Boolean) is
+      Curr : REF_VAL;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Curr := Find_Member(Iter.Robj.all, Val);
+      if (Curr = NULL_REF) then
+         Found := False;
+      else
+         Found := True;
+         Iter.Update := Iter.Robj.Update;
+         Iter.Curr := Curr;
+         Links.Set_Node(Graph_Link_It'Class(Iter.Links_It),
+                        REF(Iter.Robj, Curr).Links'Access);
+      end if;
+   end Search;
+
+
+   ------------------------------------------------------------------------
+   procedure Search_Again (Iter  : in out Iterator;
+                           Found : out Boolean) is
+   begin
+      Check_Iterator(Iter);
+
+      -- No duplicate support, so search again alway fails.
+      Found := False;
+   end Search_Again;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Curr).Val
+              = REF(Iter2.Robj, Iter2.Curr).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type)
+                 return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Curr).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator)
+                 return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Curr).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+      New_Curr : REF_VAL;
+      Hash_Val : Positive;
+   begin
+      Check_Iterator(Iter);
+
+      -- Find the next value in the graph so the iterator position may be
+      -- set to it when the current value is deleted.
+      New_Curr := REF(Iter.Robj, Iter.Curr).Next;
+      if (New_Curr = NULL_REF) then
+         Hash_Val := (Do_Hash(REF(Iter.Robj, Iter.Curr).Val)
+                      mod Iter.Robj.Hash_Size) + 1;
+         if (Hash_Val /= Iter.Robj.Nodes'Last) then
+            for I in (Hash_Val + 1) .. Iter.Robj.Nodes'Last loop
+               if (Iter.Robj.Nodes(I) /= NULL_REF) then
+                  New_Curr := Iter.Robj.Nodes(I);
+                  exit;
+               end if;
+            end loop;
+         end if;
+      end if;
+
+      Internal_Delete(Iter.Robj.all, Iter.Curr);
+
+      if (New_Curr = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Curr := New_Curr;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_Class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := O.Update - 1;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+      Curr : REF_VAL := NULL_REF;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      for I in Iter.Robj.Nodes'Range loop
+         if (Iter.Robj.Nodes(I) /= NULL_REF) then
+            Curr := Iter.Robj.Nodes(I);
+            exit;
+         end if;
+      end loop;
+
+      if (Curr = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Curr := Curr;
+         Iter.Update := Iter.Robj.Update;
+         Links.Set_Node(Graph_Link_It'Class(Iter.Links_It),
+                        REF(Iter.Robj, Iter.Curr).Links'Access);
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+      Curr     : REF_VAL := NULL_REF;
+      Hash_Val : Positive;
+   begin
+      Check_Iterator(Iter);
+
+      if (REF(Iter.Robj, Iter.Curr).Next = NULL_REF) then
+         Hash_Val := (Do_Hash(REF(Iter.Robj, Iter.Curr).Val)
+                      mod Iter.Robj.Hash_Size) + 1;
+         if (Hash_Val /= Iter.Robj.Nodes'Last) then
+            for I in (Hash_Val + 1) .. Iter.Robj.Nodes'Last loop
+               if (Iter.Robj.Nodes(I) /= NULL_REF) then
+                  Curr := Iter.Robj.Nodes(I);
+                  exit;
+               end if;
+            end loop;
+         end if;
+      else
+         Curr := REF(Iter.Robj, Iter.Curr).Next;
+      end if;
+
+      if (Curr = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Curr := Curr;
+         Links.Set_Node(Graph_Link_It'Class(Iter.Links_It),
+                        REF(Iter.Robj, Iter.Curr).Links'Access);
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return REF(Iter.Robj, Iter.Curr).Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Val := Get(Iter);
+      Next(Iter, Is_End);
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      if (Iter1.Curr /= Iter2.Curr) then
+         return False;
+      else
+         return True;
+      end if;
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Link (From       : in out Iterator;
+                       To         : in out Iterator;
+                       Contents   : in Link_Contained_Type;
+                       Ignore_Dup : in Boolean             := True) is
+   begin
+      Check_Iterator(From);
+      Check_Iterator(To);
+      if (From.Robj /= To.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      Internal_Add_Link(From.Robj.all,
+                        From.Curr,
+                        To.Curr,
+                        Contents,
+                        Ignore_Dup);
+   end Add_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Link (From       : in out Iterator;
+                       To         : in Contained_Type;
+                       Contents   : in Link_Contained_Type;
+                       Ignore_Dup : in Boolean      := True) is
+      To_Curr    : REF_VAL;
+   begin
+      Check_Iterator(From);
+
+      To_Curr := Find_Member(From.Robj.all, To);
+      if (To_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Internal_Add_Link(From.Robj.all,
+                        From.Curr,
+                        To_Curr,
+                        Contents,
+                        Ignore_Dup);
+   end Add_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Link (From       : in Contained_Type;
+                       To         : in out Iterator;
+                       Contents   : in Link_Contained_Type;
+                       Ignore_Dup : in Boolean      := True) is
+      From_Curr  : REF_VAL;
+   begin
+      Check_Iterator(To);
+
+      From_Curr := Find_Member(To.Robj.all, From);
+      if (From_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Internal_Add_Link(To.Robj.all,
+                        From_Curr,
+                        To.Curr,
+                        Contents,
+                        Ignore_Dup);
+   end Add_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete_Link (Iter   : in out Iterator;
+                          Is_End : out End_Marker) is
+      ONode     : REF_VAL;
+      Instance  : Positive;
+      Local_Val : Link_Contained_Type;
+   begin
+      Check_Iterator(Iter);
+
+      -- Get the node the link references
+      ONode := REF_VAL
+        (Links.Get(Graph_Link_It'Class(Iter.Links_It)));
+
+      -- If duplicates are allowed, we need to find which instance of the
+      -- links from this node to the other it is so we can delete the
+      -- corresponding link back.
+      if (Allow_Duplicate_Links) then
+         Instance := Links.Get_Instance_Number
+                       (Graph_Link_It'Class(Iter.Links_It));
+      else
+         Instance := 1;
+      end if;
+
+      if (Iter.Robj.Link_Cb /= null) then
+         -- Call the deleted callback for the reference to the node.
+         Local_Val := Links.Get_Contents(Graph_Link_It'Class(Iter.Links_It));
+         Deleted(Iter.Robj.Link_Cb, Iter.Robj.all, Local_Val);
+--$START GRAPH
+         -- Call the deleted callback for the reference back.
+         Local_Val := Links.Get_Contents
+                        (Graph_Link'Class(REF(Iter.Robj, ONode).Links),
+                         REF_BASE(Iter.Curr),
+                         Instance);
+         Deleted(Iter.Robj.Link_Cb, Iter.Robj.all, Local_Val);
+--$END GRAPH
+      end if;
+
+      -- Delete the link to the other node.
+      Links.Delete(Graph_Link_It'Class(Iter.Links_It), Is_End);
+
+      -- Fixme - I might want to add some exception handling here.  But
+      -- what can I do?  Re-add the link?
+
+      -- Now delete the link back to the referencing node.
+--$START GRAPH
+      Links.Delete_Val(Graph_Link'Class(REF(Iter.Robj, ONode).Links),
+                       REF_BASE(Iter.Curr),
+                       Instance);
+--$END GRAPH
+--$START DIGRAPH
+      Links.Delete_Val(Graph_Link'Class(REF(Iter.Robj, ONode).From_Links),
+                       REF_BASE(Iter.Curr),
+                       Instance);
+--$END DIGRAPH
+   end Delete_Link;
+
+
+   ------------------------------------------------------------------------
+   function Find_Link (From : in Iterator;
+                       To   : in Iterator)
+                       return Iterator is
+      Retval : Iterator;
+      Found  : Boolean;
+   begin
+      Check_Iterator(From);
+      Check_Iterator(To);
+
+      if (From.Robj /= To.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      Retval := From;
+      Links.Find(Graph_Link_It'Class(Retval.Links_It),
+                 REF_BASE(To.Curr),
+                 Found);
+      if (not Found) then
+         raise Item_Not_Found;
+      end if;
+
+      return Retval;
+   end Find_Link;
+
+
+   ------------------------------------------------------------------------
+   function Find_Link (From : in Iterator;
+                       To   : in Contained_Type)
+                       return Iterator is
+      Retval  : Iterator;
+      To_Curr : REF_VAL;
+      Found     : Boolean;
+   begin
+      To_Curr := Find_Member(From.Robj.all, To);
+      if (To_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Retval := From;
+      Links.Find(Graph_Link_It'Class(Retval.Links_It),
+                 REF_BASE(To_Curr),
+                 Found);
+      if (not Found) then
+         raise Item_Not_Found;
+      end if;
+
+      return Retval;
+   end Find_Link;
+
+
+   ------------------------------------------------------------------------
+   function Find_Link (From : in Contained_Type;
+                       To   : in Iterator)
+                       return Iterator is
+      Retval    : Iterator;
+      From_Curr : REF_VAL;
+      Found     : Boolean;
+   begin
+      From_Curr := Find_Member(To.Robj.all, From);
+      if (From_Curr = NULL_REF) then
+         raise Item_Not_Found;
+      end if;
+
+      Retval := To;
+      Links.Find(Graph_Link_It'Class(Retval.Links_It),
+                 REF_BASE(From_Curr),
+                 Found);
+      if (not Found) then
+         raise Item_Not_Found;
+      end if;
+
+      return Retval;
+   end Find_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Find_Link (From  : in out Iterator;
+                        To    : in Iterator;
+                        Found : out Boolean) is
+   begin
+      Check_Iterator(From);
+      Check_Iterator(To);
+
+      if (From.Robj /= To.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      Links.Find(Graph_Link_It'Class(From.Links_It),
+                 REF_BASE(To.Curr),
+                 Found);
+   end Find_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Find_Link (From  : in out Iterator;
+                        To    : in Contained_Type;
+                        Found : out Boolean) is
+      Retval  : Iterator;
+      To_Curr : REF_VAL;
+   begin
+      To_Curr := Find_Member(From.Robj.all, To);
+      if (To_Curr = NULL_REF) then
+         Found := False;
+         return;
+      end if;
+
+      Links.Find(Graph_Link_It'Class(From.Links_It),
+                 REF_BASE(To_Curr),
+                 Found);
+   end Find_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Find_Link_Again (From  : in out Iterator;
+                              Found : out Boolean) is
+   begin
+      Check_Iterator(From);
+
+      Links.Find_Again(Graph_Link_It'Class(From.Links_It),
+                       Found);
+   end Find_Link_Again;
+
+
+   ------------------------------------------------------------------------
+   function Link_Exists (From  : in Iterator;
+                         To    : in Iterator)
+                         return Boolean is
+   begin
+      return Links.Val_Exists(Graph_Link'Class
+                                (REF(From.Robj, From.Curr).Links),
+                              REF_BASE(To.Curr));
+   end Link_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Link_Exists (From  : in Iterator;
+                         To    : in Contained_Type)
+                         return Boolean is
+      To_Curr : REF_VAL;
+   begin
+      To_Curr := Find_Member(From.Robj.all, To);
+      if (To_Curr = NULL_REF) then
+         return False;
+      end if;
+
+      return Links.Val_Exists(Graph_Link'Class
+                                (REF(From.Robj, From.Curr).Links),
+                              REF_BASE(To_Curr));
+   end Link_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Link_Exists (From  : in Contained_Type;
+                         To    : in Iterator)
+                         return Boolean is
+      From_Curr : REF_VAL;
+   begin
+      From_Curr := Find_Member(To.Robj.all, From);
+      if (From_Curr = NULL_REF) then
+         return False;
+      end if;
+
+      return Links.Val_Exists(Graph_Link'Class
+                                (REF(To.Robj, From_Curr).Links),
+                              REF_BASE(To.Curr));
+   end Link_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Link_Exists (O     : in Object;
+                         From  : in Contained_Type;
+                         To    : in Contained_Type)
+                         return Boolean is
+      From_Curr : REF_VAL;
+      To_Curr   : REF_VAL;
+   begin
+      From_Curr := Find_Member(O, From);
+      if (From_Curr = NULL_REF) then
+         return False;
+      end if;
+
+      To_Curr := Find_Member(O, To);
+      if (To_Curr = NULL_REF) then
+         return False;
+      end if;
+
+      return Links.Val_Exists(Graph_Link'Class(REF(O, From_Curr).Links),
+                              REF_BASE(To_Curr));
+   end Link_Exists;
+
+
+   ------------------------------------------------------------------------
+   procedure First_Link (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Links.First(Graph_Link_It'Class(Iter.Links_It), Is_End);
+   end First_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Next_Link (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Links.Next(Graph_Link_It'Class(Iter.Links_It), Is_End);
+   end Next_Link;
+
+
+   ------------------------------------------------------------------------
+   function Follow_Link (Iter : in Iterator) return Iterator is
+      Retval : Iterator;
+      ONode  : REF_VAL;
+   begin
+      Check_Iterator(Iter);
+
+      ONode := REF_VAL(Links.Get(Graph_Link_It'Class(Iter.Links_It)));
+      Retval := Iter;
+      Retval.Curr := ONode;
+      Links.Set_Node(Graph_Link_It'Class(Retval.Links_It),
+                     REF(Iter.Robj, Retval.Curr).Links'Access);
+
+      return Retval;
+   end Follow_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Follow_Link (Iter : in out Iterator) is
+      ONode  : REF_VAL;
+   begin
+      Check_Iterator(Iter);
+      ONode := REF_VAL(Links.Get(Graph_Link_It'Class(Iter.Links_It)));
+      Iter.Curr := ONode;
+      Links.Set_Node(Graph_Link_It'Class(Iter.Links_It),
+                     REF(Iter.Robj, Iter.Curr).Links'Access);
+   end Follow_Link;
+
+
+   ------------------------------------------------------------------------
+   function Get_Link (Iter : in Iterator) return Link_Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return (Links.Get_Contents(Graph_Link_It'Class(Iter.Links_It)));
+   end Get_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Link (Iter : in out Iterator;
+                       Val  : in Link_Contained_Type) is
+      Local_Val1 : Link_Contained_Type;
+      Old_Val    : Link_Contained_Type;
+--$START GRAPH
+      Local_Val2 : Link_Contained_Type;
+      ONode      : REF_VAL;
+      OIter      : Link_List_It;
+      Instance   : Positive;
+      Found      : Boolean;
+--$END GRAPH
+   begin
+      Check_Iterator(Iter);
+
+--$START GRAPH
+      -- Find the node we reference.
+      ONode := REF_VAL(Links.Get(Graph_Link_It'Class(Iter.Links_It)));
+
+      -- If we allow duplicates, find which link between the two nodes we
+      -- are using.
+      if (Allow_Duplicate_Links) then
+         Instance := Links.Get_Instance_Number
+                       (Graph_Link_It'Class(Iter.Links_It));
+      else
+         Instance := 1;
+      end if;
+--$END GRAPH
+
+      if (Iter.Robj.Link_Cb /= null) then
+         -- Do the Added call for the link to the other node.
+         Local_Val1 := Val;
+         Added(Iter.Robj.Link_Cb, Iter.Robj.all, Local_Val1);
+--$START GRAPH
+         -- Do the Added call for the link back.
+         Local_Val2 := Val;
+         Added(Iter.Robj.Link_Cb, Iter.Robj.all, Local_Val2);
+--$END GRAPH
+         Old_Val := Links.Get_Contents(Graph_Link_It'Class(Iter.Links_It));
+         Deleted(Iter.Robj.Link_Cb, Iter.Robj.all, Old_Val);
+--$START GRAPH
+         -- Do the Deleted call for the link back.
+         Old_Val := Links.Get_Contents
+                      (Graph_Link'Class(REF(Iter.Robj, ONode).Links),
+                       REF_BASE(Iter.Curr),
+                       Instance);
+         Deleted(Iter.Robj.Link_Cb, Iter.Robj.all, Old_Val);
+--$END GRAPH
+      end if;
+
+      Links.Set_Contents(Graph_Link_It'Class(Iter.Links_It), Local_Val1);
+--$START DIGRAPH
+      -- For DiGraphs, the link contents on links back do not matter
+      -- because we don't use them.
+--$END DIGRAPH
+--$START GRAPH
+      -- For standard graphs, we need to set the value for the link back,
+      -- too.
+
+      -- Now position an iterator on the reference back and set the value.
+      Links.Set_Node(Graph_Link_It'Class(OIter),
+                     REF(Iter.Robj, ONode).Links'Access);
+      Links.Find(Graph_Link_It'Class(OIter),
+                 REF_BASE(Iter.Curr),
+                 Found,
+                 Instance);
+      if (not Found) then
+         raise Internal_Graph_Error;
+      end if;
+
+      Links.Set_Contents(Graph_Link_It'Class(OIter), Local_Val2);
+--$END GRAPH
+   end Set_Link;
+
+
+   ------------------------------------------------------------------------
+   function Link_Count (Iter : in Iterator) return Natural is
+   begin
+      Check_Iterator(Iter);
+
+      return Links.Link_Count
+               (Graph_Link'Class(REF(Iter.Robj, Iter.Curr).Links));
+   end Link_Count;
+
+end Asgc.Graph.CTYPE.GRAPHTYPEMANAGED;

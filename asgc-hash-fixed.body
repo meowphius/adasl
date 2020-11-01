@@ -1,0 +1,712 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+-- A close hash table.
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Hash.FixedMANAGED is
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+
+      if (Iter.Pos > Iter.Robj.Data'Last) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_No_Pos (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+   end Check_Iterator_No_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Go to the next index in the hash table, wrapping around to the
+   -- beginning of the table if at the end.
+   function Next (O   : in Object'Class;
+                  Loc : in Positive)
+                  return Positive is
+   begin
+      if (Loc = O.Data'Last) then
+         return O.Data'First;
+      else
+         return Loc + 1;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   -- Go to the previous index in the hash table, wrapping around to the
+   -- end of the table if at the beginning.
+   function Prev (O   : in Object'Class;
+                  Loc : in Positive)
+                  return Positive is
+   begin
+      if (Loc = O.Data'First) then
+         return O.Data'Last;
+      else
+         return Loc - 1;
+      end if;
+   end Prev;
+
+
+   ------------------------------------------------------------------------
+   -- Search the entire container for a value.
+   procedure Local_Search (O     : in Object'Class;
+                           Val   : in Contained_Type;
+                           Pos   : out Positive;
+                           Found : out Boolean) is
+      Curr : Positive;
+   begin
+      Curr := (Do_Hash(Val) mod O.Size) + 1;
+      while (O.Data(Curr).Inuse) loop
+         if (O.Data(Curr).Val = Val) then
+            Found := True;
+            Pos := Curr;
+            return;
+         end if;
+         Curr := Next(O, Curr);
+      end loop;
+
+      Found := False;
+   end Local_Search;
+
+
+   ------------------------------------------------------------------------
+   -- Delete the value at the position in one of the hash tables.  This
+   -- routine is quite complex due to this being a closed hash table.  When
+   -- we delete an item, we can open up a hole, which could break the hash
+   -- table search algorithms if left.  So we will search forward for the
+   -- next item that can fill the hole and put in in the hole.  But we have
+   -- created another hole, so we must do that again until we find an
+   -- existing hole in the hash table.
+   procedure Delete_Pos(O   : in out Object'Class;
+                        Pos : in Positive) is
+      Old_Val  : Contained_Type;
+      Curr     : Positive;
+      Min_Pos  : Positive;
+      Max_Pos  : Positive;
+      Hash_Val : Positive;
+   begin
+      Old_Val := O.Data(Pos).Val;
+
+      -- Search backwards until we find a hole.  This will be the minimum
+      -- hash value we can fill the hole with.  We need to know this
+      -- because everything afer the hole we are creating may actually hash
+      -- before us, we need to know what we can move back.
+      Min_Pos := Prev(O, Pos);
+      while (O.Data(Min_Pos).Inuse) loop
+         if (Min_Pos = Pos) then
+            raise Internal_Hash_Error;
+         end if;
+
+         Min_Pos := Prev(O, Min_Pos);
+      end loop;
+      Min_Pos := Next(O, Min_Pos);
+
+      -- We search forward, using Curr as our working position and Max_Pos
+      -- as the position of the current hole.  We are looking for something
+      -- that will go between (and including) Min_Pos and Max_Pos.
+      Max_Pos := Pos;
+      Curr := Next(O, Max_Pos);
+      while (O.Data(Curr).Inuse) loop
+         if (Curr = Pos) then
+            -- There must be at least one hole in the table.
+            raise Internal_Hash_Error;
+         end if;
+
+         Hash_Val := (Do_Hash(O.Data(Curr).Val) mod O.Size) + 1;
+         if (Min_Pos <= Max_Pos) then
+            -- Normal comparison, the range from Min to Max doesn't wrap
+            -- around the end of the table.
+            -- +------------------------------------------------------+
+            -- |       |************************|                     |
+            -- +------------------------------------------------------+
+            --        Min                      Max
+            if ((Hash_Val >= Min_Pos) and (Hash_Val <= Max_Pos)) then
+               -- We've found a value we can move into the slot, so move
+               -- it and continue the operation.
+               O.Data(Max_Pos) := O.Data(Curr);
+               Max_Pos := Curr;
+            end if;
+         else
+            -- Wrapped case, so a little different comparison.
+            -- +------------------------------------------------------+
+            -- |*****|                               |****************|
+            -- +------------------------------------------------------+
+            --      Max                             Min
+            if ((Hash_Val >= Min_Pos) or (Hash_Val <= Max_Pos)) then
+               -- We've found a value we can move into the slot, so move
+               -- it and continue the operation.
+               O.Data(Max_Pos) := O.Data(Curr);
+               Max_Pos := Curr;
+            end if;
+         end if;
+         Curr := Next(O, Curr);
+      end loop;
+      O.Count := O.Count - 1;
+      O.Update := O.Update + 1;
+      O.Data(Max_Pos).Inuse := False;
+      if (O.Cb /= null) then
+         Deleted(O.Cb, O, Old_Val);
+      end if;
+   end Delete_Pos;
+
+
+   ------------------------------------------------------------------------
+   -- Return the number of members with the value "val".
+   function Member_Count (O   : in Object'Class;
+                          Val : in Contained_Type)
+                          return Natural is
+      Hash_Val : Positive;
+      Curr     : Positive;
+      Count    : Natural  := 0;
+   begin
+      Hash_Val := (Do_Hash(Val) mod O.Size) + 1;
+      Curr := Hash_Val;
+      while (O.Data(Curr).Inuse) loop
+         if (O.Data(Curr).Val = Val) then
+            Count := Count + 1;
+         end if;
+         Curr := Next(O, Curr);
+         if (Curr = Hash_Val) then
+            raise Internal_Hash_Error;
+         end if;
+      end loop;
+
+      return Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   -- An internal next routine.  If Start_Next is True, start searching at
+   -- the next position in the container.  If Start_Next is False, start
+   -- searching at the current location in the container.
+   procedure Local_Next (Iter       : in out Iterator'Class;
+                         Is_End     : out End_Marker;
+                         Start_Next : in Boolean := True) is
+      Row  : Positive;
+   begin
+      if (Iter.Pos = Iter.Robj.Size) then
+         Is_End := Past_End;
+      else
+         if (Start_Next) then
+            Row := Iter.Pos + 1;
+         else
+            Row := Iter.Pos;
+         end if;
+
+         while ((Row < Iter.Robj.Size)
+                and then (not Iter.Robj.Data(Row).Inuse))
+         loop
+            Row := Row + 1;
+         end loop;
+         if (Iter.Robj.Data(Row).Inuse) then
+            Is_End := Not_Past_End;
+            Iter.Pos := Row;
+         else
+            Is_End := Past_End;
+         end if;
+      end if;
+   end Local_Next;
+
+
+   ------------------------------------------------------------------------
+   -- Add a value to the container and return its index.
+   procedure Local_Add (O          : in out Object'Class;
+                        Val        : in Contained_Type;
+                        Added_Node : out Positive) is
+      Hash_Val : Positive;
+      Curr     : Positive;
+   begin
+      -- Always leave at least one empty slot.
+      if (O.Count = (O.Size - 1)) then
+         raise Container_Full;
+      end if;
+
+      Hash_Val := (Do_Hash(Val) mod O.Size) + 1;
+      Curr := Hash_Val;
+      while (O.Data(Curr).Inuse) loop
+         if ((O.Data(Curr).Val = Val) and (not O.Allow_Duplicates)) then
+            raise Item_Already_Exists;
+         end if;
+         Curr := Next(O, Curr);
+         if (Curr = Hash_Val) then
+            raise Internal_Hash_Error;
+         end if;
+      end loop;
+
+      O.Data(Curr).Val := Val;
+      O.Data(Curr).Inuse := True;
+
+      O.Update := O.Update + 1;
+      O.Count := O.Count + 1;
+
+      if (O.Cb /= null) then
+         Added(O.Cb, O, O.Data(Curr).Val);
+      end if;
+
+      Added_Node := Curr;
+   end Local_Add;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+      null;
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+   begin
+      if (O.Cb /= null) then
+         for I in O.Data'Range loop
+            if (O.Data(I).Inuse) then
+               Copied(O.Cb, O, O.Data(I).Val);
+            end if;
+         end loop;
+      end if;
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+   begin
+      if (O.Cb /= null) then
+         for I in O.Data'Range loop
+            if (O.Data(I).Inuse) then
+               Deleted(O.Cb, O, O.Data(I).Val);
+            end if;
+         end loop;
+      end if;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Add (O : in out Object; Val : in Contained_Type) is
+      New_Node : Positive;
+   begin
+      Check_Object(O);
+
+      Local_Add(O, Val, New_Node);
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      Curr  : Positive;
+      Found : Boolean;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Curr, Found);
+      if (Found) then
+         Delete_Pos(O, Curr);
+      else
+         raise Item_Not_Found;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+      Curr  : Positive;
+      Found : Boolean;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Curr, Found);
+      return Found;
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Size /= O2.Size) then
+         return False;
+      else
+         -- Each object has the same count, so for every member of O1, make
+         -- sure that O2 has exactly the same number of members with the
+         -- same value.
+
+         for I in O1.Data'Range loop
+            if (O1.Data(I).Inuse
+                and then (Member_Count(O1, O1.Data(I).Val)
+                          /= Member_Count(O2, O1.Data(I).Val)))
+            then
+               return False;
+            end if;
+         end loop;
+      end if;
+
+      return True;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object)
+                          return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval : Object_Ptr;
+   begin
+      Retval := new Object(Allow_Duplicates => O.Allow_Duplicates,
+                           Size             => O.Size);
+      Retval.all := O;
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      First    : Positive;
+      Count    : Natural  := 0;
+      Hash_Val : Positive;
+   begin
+      Check_Object(O);
+
+      -- Verify that for every entry in the array that the hash value
+      -- occurs somewhere in the previous contiguous block.
+      First := O.Data'Last;
+      while (O.Data(First).Inuse) loop
+         -- The array should never be completely full.
+         if (First = 1) then
+            raise Internal_Hash_Error;
+         end if;
+
+         First := First - 1;
+      end loop;
+      First := Next(O, First);
+
+      for I in O.Data'Range loop
+         if (O.Data(I).Inuse) then
+            Hash_Val := (Do_Hash(O.Data(I).Val) mod O.Size) + 1;
+            if (First > I) then
+               -- If first > last, we have a wrap situation.
+               if ((Hash_Val < First) and (Hash_Val > I)) then
+                  raise Internal_Hash_Error;
+               end if;
+            else
+               if ((Hash_Val < First) or (Hash_Val > I)) then
+                  raise Internal_Hash_Error;
+               end if;
+            end if;
+            Count := Count + 1;
+         else
+            First := Next(O, I);
+         end if;
+      end loop;
+
+      if (Count /= O.Count) then
+         raise Internal_Hash_Error;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_Class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := Invalid_Update;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Add(Iter.Robj.all, Val, Iter.Pos);
+      Iter.Update := Iter.Robj.Update;
+   end Add;
+
+   ------------------------------------------------------------------------
+   procedure Search (Iter  : in out Iterator;
+                     Val   : in Contained_Type;
+                     Found : out Boolean) is
+      Local_Found : Boolean;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Local_Search(Iter.Robj.all, Val, Iter.Pos, Local_Found);
+      Found := Local_Found;
+      if (Local_Found) then
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Search;
+
+
+   ------------------------------------------------------------------------
+   procedure Search_Again (Iter  : in out Iterator;
+                           Found : out Boolean) is
+      Curr : Positive;
+   begin
+      Check_Iterator(Iter);
+
+      Curr := Next(Iter.Robj.all, Iter.Pos);
+      while (Iter.Robj.Data(Curr).Inuse) loop
+         if (Iter.Robj.Data(Curr).Val = Iter.Robj.Data(Iter.Pos).Val) then
+            Found := True;
+            Iter.Pos := Curr;
+            return;
+         end if;
+         Curr := Next(Iter.Robj.all, Curr);
+      end loop;
+
+      Found := False;
+      Iter.Update := Iter.Robj.Update - 1;
+   end Search_Again;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      -- This can happen a lot, so do a short circuit for it.
+      if (Iter.Robj.Count /= 0) then
+         for I in Iter.Robj.Data'Range loop
+            if (Iter.Robj.Data(I).Inuse) then
+               Iter.Pos := I;
+               Iter.Update := Iter.Robj.Update;
+               Is_End := Not_Past_End;
+               return;
+            end if;
+         end loop;
+      end if;
+
+      Is_End := Past_End;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Local_Next(Iter, Is_End);
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+      Local_Is_End : End_Marker;
+   begin
+      Check_Iterator(Iter);
+
+      Delete_Pos(Iter.Robj.all, Iter.Pos);
+
+      -- Since a new value might be moved into the hole we just created,
+      -- set Start_Next to False so we will start searching at the current
+      -- position.
+      Local_Next(Iter, Local_Is_End, Start_Next => False);
+
+      Is_End := Local_Is_End;
+      if (Local_Is_End = Not_Past_End) then
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      return (Iter1.Pos = Iter2.Pos);
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Robj.Data(Iter.Pos).Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Val := Iter.Robj.Data(Iter.Pos).Val;
+      Local_Next(Iter, Is_End);
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (Iter1.Robj.Data(Iter1.Pos).Val = Iter2.Robj.Data(Iter2.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Robj.Data(Iter.Pos).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Iter.Robj.Data(Iter.Pos).Val = Val);
+   end "=";
+
+end Asgc.Hash.FixedMANAGED;

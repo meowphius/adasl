@@ -1,0 +1,797 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.List.CTYPEMANAGED is
+
+--$START DYNAMIC
+   procedure Free_Node is new Ada.Unchecked_Deallocation(Node,
+                                                         Node_Ptr);
+--$END DYNAMIC
+
+   procedure Free_Iterator is new Ada.Unchecked_Deallocation(Iterator,
+                                                             Iterator_Ptr);
+
+--$START EXPANDABLE
+   procedure Free_Node_Array is new Ada.Unchecked_Deallocation(Node_Array,
+                                                               Node_Array_Ptr);
+
+   ------------------------------------------------------------------------
+   -- Increase the size of an expandable array.
+   procedure Increase_Data_Size (O : in out Object'Class) is
+      New_Array : Node_Array_Ptr;
+   begin
+      if (O.Increment = 0) then
+         raise Container_Full;
+      end if;
+      New_Array := new Node_Array(1 .. (O.Data.all'Last
+                                        + Node_Ref(O.Increment)));
+      New_Array(1 .. O.Data.all'Last) := O.Data.all;
+      for I in O.Data.all'Last + 1 .. New_Array.all'Last loop
+         New_Array(I).Next := O.Free_List;
+         O.Free_List := I;
+      end loop;
+      Free_Node_Array(O.Data);
+      O.Data := New_Array;
+   end Increase_Data_Size;
+--$END EXPANDABLE
+
+
+   ------------------------------------------------------------------------
+   -- Allocate a free node for the list.
+   procedure Alloc_Node (O    : in out Object'Class;
+                         Item : out REF_VAL) is
+   begin
+--$START DYNAMIC
+      Item := new Node;
+--$END DYNAMIC
+--$START FIXED
+      if (O.Free_List = NULL_REF) then
+         raise Container_Full;
+      end if;
+      Item := O.Free_List;
+      O.Free_List := O.Data(Item).Next;
+      O.Data(Item).Next := Null_Node;
+--$END FIXED
+--$START EXPANDABLE
+      if (O.Free_List = NULL_REF) then
+         Increase_Data_Size(O);
+      end if;
+      Item := O.Free_List;
+      O.Free_List := O.Data(Item).Next;
+      O.Data(Item).Next := Null_Node;
+--$END EXPANDABLE
+   end Alloc_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Free a node for the list.
+   procedure Free_Node (O    : in out Object'Class;
+                        Item : in out REF_VAL) is
+   begin
+--$START DYNAMIC
+      Free_Node(Item);
+--$END DYNAMIC
+--$START FIXED
+      O.Data(Item).Next := O.Free_List;
+      O.Free_List := Item;
+      Item := Null_Node;
+--$END FIXED
+--$START EXPANDABLE
+      O.Data(Item).Next := O.Free_List;
+      O.Free_List := Item;
+      Item := Null_Node;
+--$END EXPANDABLE
+   end Free_Node;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an object is valid, that is has not been freed.  This is
+   -- not a perfect check, but will hopefully help find some bugs.
+   procedure Check_Object (O : in Object'Class) is
+   begin
+      if (O.Is_Free) then
+         raise Object_Free;
+      end if;
+   end Check_Object;
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  It must not have been freed, it
+   -- must be initialized, its object must be valid, and it must not have
+   -- been modified since the last time the iterator was positioned.
+   procedure Check_Iterator (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+
+      if (Iter.Pos = NULL_REF) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't bother checking its positions.  This is
+   -- primarily for methods that set some the position of the iterator.
+   procedure Check_Iterator_Null_Ok (Iter : in Iterator'Class) is
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      Check_Object(Iter.Robj.all);
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Object_Updated;
+      end if;
+   end Check_Iterator_Null_Ok;
+
+
+   ------------------------------------------------------------------------
+   -- Search the list for the given position.  Return the value that is
+   -- previous to the found entry and the found entry if found.  The Prev
+   -- value will be null if the found value is first in the list.
+   procedure Local_Search(O      : in Object;
+                          Val    : in Contained_Type;
+                          Prev   : out REF_VAL;
+                          Curr   : out REF_VAL;
+                          Found  : out Boolean) is
+      LPrev : REF_VAL;
+      LCurr : REF_VAL;
+   begin
+      LCurr := O.Head;
+      LPrev := NULL_REF;
+      while ((LCurr /= NULL_REF)
+             and then (REF(O, LCurr).Val /= Val))
+      loop
+         Prev := LCurr;
+         LCurr := REF(O, LCurr).Next;
+      end loop;
+      if (LCurr = NULL_REF) then
+         Found := False;
+      else
+         Found := True;
+         Curr := LCurr;
+         Prev := LPrev;
+      end if;
+   end Local_Search;
+
+
+   ------------------------------------------------------------------------
+   -- This is a controlled type, so we have those methods to handle.
+
+
+   ------------------------------------------------------------------------
+   procedure Initialize (O : in out Object) is
+   begin
+--$START DYNAMIC
+      null;
+--$END DYNAMIC
+--$START FIXED
+      -- Build the free list.
+      for I in 1 .. O.Size loop
+         O.Data(I).Next := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END FIXED
+--$START EXPANDABLE
+      -- Build the free list.
+      for I in 1 .. O.Initial_Size loop
+         O.Data(I).Next := O.Free_List;
+         O.Free_List := I;
+      end loop;
+--$END EXPANDABLE
+   end Initialize;
+
+
+   ------------------------------------------------------------------------
+   procedure Adjust (O : in out Object) is
+      New_List : REF_VAL := NULL_REF;
+      New_Curr : REF_VAL;
+      Old_Curr : REF_VAL := O.Head;
+   begin
+--$START DYNAMIC
+      if (O.Head = null) then
+         O.Head := null;
+         O.Tail := null;
+      else
+         -- Copy the list.
+         New_List := new Node;
+         New_List.Val := Old_Curr.Val;
+
+         New_Curr := New_List;
+         while (Old_Curr.Next /= null) loop
+            New_Curr.Next := new Node;
+            New_Curr.Next.Val := Old_Curr.Next.Val;
+            Old_Curr := Old_Curr.Next;
+            New_Curr := New_Curr.Next;
+         end loop;
+         O.Head := New_List;
+         O.Tail := New_Curr;
+      end if;
+--$END DYNAMIC
+--$START EXPANDABLE
+      O.Data := new Node_Array'(O.Data.all);
+--$END EXPANDABLE
+
+      -- Call the Copied callback method for every item in the new list.
+      if (O.Cb /= null) then
+         New_Curr := O.Head;
+         while (New_Curr /= NULL_REF) loop
+            Copied(O.Cb, O, REF(O, New_Curr).Val);
+            New_Curr := REF(O, New_Curr).Next;
+         end loop;
+      end if;
+   end Adjust;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (O : in out Object) is
+      Curr    : REF_VAL := O.Head;
+      Temp    : REF_VAL;
+   begin
+      while (Curr /= NULL_REF) loop
+         if (O.Cb /= null) then
+            Deleted(O.Cb, O, REF(O, Curr).Val);
+         end if;
+         Temp := REF(O, Curr).Next;
+--$START DYNAMIC
+         Free_Node(Curr);
+--$END DYNAMIC
+         Curr := Temp;
+      end loop;
+
+--$START EXPANDABLE
+      Free_Node_Array(O.Data);
+--$END EXPANDABLE
+      O.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   procedure Finalize (Iter : in out Iterator) is
+   begin
+      Iter.Is_Free := True;
+   end Finalize;
+
+
+   ------------------------------------------------------------------------
+   -- The functions that follow are defined as abstract in previous
+   -- packages.  See those packages for descriptions of what these
+   -- methods do.
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (O   : in out Object;
+                     Val : in Contained_Type) is
+      To_Free  : REF_VAL;
+      Next_Val : REF_VAL;
+      Prev     : REF_VAL;
+      Found    : Boolean;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Prev, To_Free, Found);
+      if (not Found) then
+         raise Item_Not_Found;
+      end if;
+
+      Next_Val := REF(O, To_Free).Next;
+      if (Prev /= NULL_REF) then
+         -- Not deleting the first item, modify the prev's next ref.
+         REF(O, Prev).Next := Next_Val;
+      else
+         -- Deleting the first item, change the head.
+         O.Head := Next_Val;
+         if (Next_Val = NULL_REF) then
+            -- Deleting the only item.
+            O.Tail := NULL_REF;
+         end if;
+      end if;
+      O.Count := O.Count - 1;
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Deleted(O.Cb,O, REF(O, To_Free).Val);
+      end if;
+
+      Free_Node(O, To_Free);
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Value_Exists (O   : in Object;
+                          Val : in Contained_Type)
+                          return Boolean is
+      Curr  : REF_VAL;
+      Prev  : REF_VAL;
+      Found : Boolean;
+   begin
+      Check_Object(O);
+
+      Local_Search(O, Val, Prev, Curr, Found);
+      return Found;
+   end Value_Exists;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Head (O : in out Object; Val : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Object(O);
+
+      Alloc_Node(O, New_Node);
+      REF(O, New_Node).Val := Val;
+      REF(O, New_Node).Next := O.Head;
+      O.Head := New_Node;
+      if (O.Tail = NULL_REF) then
+         O.Tail := New_Node;
+      end if;
+
+      O.Count := O.Count + 1;
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Added(O.Cb, O, REF(O, New_Node).Val);
+      end if;
+   end Add_Head;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Tail (O : in out Object; Val : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Object(O);
+
+      Alloc_Node(O, New_Node);
+      REF(O, New_Node).Val := Val;
+      REF(O, New_Node).Next := NULL_REF;
+      if (O.Tail = NULL_REF) then
+         O.Head := New_Node;
+      else
+         REF(O, O.Tail).Next := New_Node;
+      end if;
+      O.Tail := New_Node;
+
+      O.Count := O.Count + 1;
+      O.Update := O.Update + 1;
+
+      if (O.Cb /= null) then
+         Added(O.Cb, O, REF(O, New_Node).Val);
+      end if;
+   end Add_Tail;
+
+
+   ------------------------------------------------------------------------
+   function "=" (O1, O2 : in Object) return Boolean is
+      Curr1 : REF_VAL;
+      Curr2 : REF_VAL;
+   begin
+      Check_Object(O1);
+      Check_Object(O2);
+
+      if (O1.Count /= O2.Count) then
+         return False;
+      else
+         Curr1 := O1.Head;
+         Curr2 := O2.Head;
+         while (Curr1 /= NULL_REF) loop
+            if (Curr2 = NULL_REF) then
+               raise Internal_List_Error;
+            end if;
+
+            if (REF(O1, Curr1).Val /= REF(O2, Curr2).Val) then
+               return False;
+            end if;
+
+            Curr1 := REF(O1, Curr1).Next;
+            Curr2 := REF(O2, Curr2).Next;
+         end loop;
+
+         if (Curr2 /= NULL_REF) then
+            raise Internal_List_Error;
+         end if;
+
+         return True;
+      end if;
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function Member_Count (O : in Object)
+                          return Natural is
+   begin
+      Check_Object(O);
+
+      return O.Count;
+   end Member_Count;
+
+
+   ------------------------------------------------------------------------
+   procedure Verify_Integrity (O : in Object) is
+      Curr  : REF_VAL;
+      Count : Natural;
+   begin
+      Check_Object(O);
+
+      if (O.Count = 0) then
+         if ((O.Head /= NULL_REF) or (O.Tail /= NULL_REF)) then
+            raise Internal_List_Error;
+         end if;
+      else
+         Curr := O.Head;
+         Count := 1;
+         while (REF(O, Curr).Next /= NULL_REF) loop
+            if (Count > O.Count) then
+               raise Internal_List_Error;
+            end if;
+            Curr := REF(O, Curr).Next;
+            Count := Count + 1;
+         end loop;
+         if (Count /= O.Count) then
+            raise Internal_List_Error;
+         end if;
+         if (Curr /= O.Tail) then
+            raise Internal_List_Error;
+         end if;
+      end if;
+   end Verify_Integrity;
+
+
+   ------------------------------------------------------------------------
+   function Copy (O : in Object) return Asgc.Object_Class is
+      Retval : Object_Ptr;
+   begin
+--$START DYNAMIC
+      Retval := new Object;
+--$END DYNAMIC
+--$START FIXED
+      Retval := new Object(Size => O.Size);
+--$END FIXED
+--$START EXPANDABLE
+      Retval := new Object(Initial_Size => O.Initial_Size,
+                           Increment    => O.Increment);
+--$END EXPANDABLE
+      Retval.all := O;
+
+      return Asgc.Object_Class(Retval);
+   end Copy;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_Before (Iter : in out Iterator; Val : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Iterator_Null_Ok(Iter);
+
+      Alloc_Node(Iter.Robj.all, New_Node);
+      REF(Iter.Robj, New_Node).Val := Val;
+      REF(Iter.Robj, New_Node).Next := Iter.Pos;
+      if (Iter.Robj.Tail = NULL_REF) then
+         -- The list is empty, this becomes the only member.
+         Iter.Robj.Head := New_Node;
+         Iter.Robj.Tail := New_Node;
+      elsif (Iter.Robj.Head = Iter.Pos) then
+         -- If we are at the head, the new item becomes the new head.
+         Iter.Robj.Head := New_Node;
+      else
+         REF(Iter.Robj, Iter.Prev).Next := New_Node;
+      end if;
+      Iter.Pos := New_Node;
+
+      Iter.Robj.Count := Iter.Robj.Count + 1;
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      Iter.Update := Iter.Robj.Update;
+
+      if (Iter.Robj.Cb /= null) then
+         Added(Iter.Robj.Cb,
+               Iter.Robj.all,
+               REF(Iter.Robj, New_Node).Val);
+      end if;
+   end Add_Before;
+
+
+   ------------------------------------------------------------------------
+   procedure Add_After (Iter : in out Iterator; Val : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Iterator_Null_Ok(Iter);
+
+      Alloc_Node(Iter.Robj.all, New_Node);
+      REF(Iter.Robj, New_Node).Val := Val;
+      if (Iter.Robj.Tail = NULL_REF) then
+         -- The list is empty, this becomes the only member.
+         Iter.Robj.Head := New_Node;
+         Iter.Robj.Tail := New_Node;
+      else
+         REF(Iter.Robj, New_Node).Next := REF(Iter.Robj, Iter.Pos).Next;
+         REF(Iter.Robj, Iter.Pos).Next := New_Node;
+         if (Iter.Robj.Tail = Iter.Pos) then
+            -- If we are at the tail, the new item becomes the new tail.
+            Iter.Robj.Tail := New_Node;
+         end if;
+      end if;
+      Iter.Prev := Iter.Pos;
+      Iter.Pos := New_Node;
+
+      Iter.Robj.Count := Iter.Robj.Count + 1;
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      Iter.Update := Iter.Robj.Update;
+
+      if (Iter.Robj.Cb /= null) then
+         Added(Iter.Robj.Cb,
+               Iter.Robj.all,
+               REF(Iter.Robj, New_Node).Val);
+      end if;
+   end Add_After;
+
+
+   ------------------------------------------------------------------------
+   procedure Set (Iter : in Iterator; Val : in Contained_Type) is
+   begin
+      Check_Iterator(Iter);
+
+      REF(Iter.Robj, Iter.Pos).Val := Val;
+   end Set;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : access Object) return Asgc.Iterator_Class is
+      Retval : Iterator_Ptr;
+   begin
+      Check_Object(O.all);
+
+      Retval := new Iterator;
+      Retval.Robj := Object_Class(O);
+      Retval.Update := Invalid_Update;
+
+      return Asgc.Iterator_Class(Retval);
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   function New_Iterator (O : in Object_Class) return Iterator is
+      Retval : Iterator;
+   begin
+      Retval.Robj := O;
+      Retval.Update := Invalid_Update;
+
+      return Retval;
+   end New_Iterator;
+
+
+   ------------------------------------------------------------------------
+   procedure Free (Iter : access Iterator) is
+      To_Free : Iterator_Ptr := Iterator_Ptr(Iter);
+   begin
+      if (Iter.Is_Free) then
+         raise Iterator_Free;
+      end if;
+
+      Free_Iterator(To_Free);
+   end Free;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Container (Iter : in out Iterator;
+                            O    : in Asgc.Object_Class) is
+   begin
+      Check_Object(Object'Class(O.all));
+
+      Iter.Robj := Object_Class(O);
+      Iter.Update := Invalid_Update;
+   end Set_Container;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Iter : in out Iterator;
+                  Val  : in Contained_Type) is
+      New_Node : REF_VAL;
+   begin
+      Check_Iterator_Null_Ok(Iter);
+
+      Alloc_Node(Iter.Robj.all, New_Node);
+      REF(Iter.Robj, New_Node).Val := Val;
+
+      Iter.Prev := Iter.Robj.Tail;
+      if (Iter.Robj.Tail = NULL_REF) then
+         -- The list is empty, this becomes the only member.
+         Iter.Robj.Head := New_Node;
+         Iter.Robj.Tail := New_Node;
+      else
+         -- Add it on to the end of the list.
+         REF(Iter.Robj, New_Node).Next := NULL_REF;
+         REF(Iter.Robj, Iter.Robj.Tail).Next := New_Node;
+         Iter.Robj.Tail := New_Node;
+      end if;
+      Iter.Pos := New_Node;
+
+      Iter.Robj.Count := Iter.Robj.Count + 1;
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      Iter.Update := Iter.Robj.Update;
+
+      if (Iter.Robj.Cb /= null) then
+         Added(Iter.Robj.Cb,
+               Iter.Robj.all,
+               REF(Iter.Robj, New_Node).Val);
+      end if;
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Object(Iter.Robj.all);
+
+      Iter.Pos := Iter.Robj.Head;
+      Iter.Prev := NULL_REF;
+      Iter.Update := Iter.Robj.Update;
+      if (Iter.Pos = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter : in out Iterator; Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (REF(Iter.Robj, Iter.Pos).Next = NULL_REF) then
+         Is_End := Past_End;
+      else
+         Iter.Prev := Iter.Pos;
+         Iter.Pos := REF(Iter.Robj, Iter.Pos).Next;
+         Is_End := Not_Past_End;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter : in out Iterator; Is_End : out End_Marker) is
+      To_Free  : REF_VAL;
+      Next_Val : REF_VAL;
+   begin
+      Check_Iterator(Iter);
+
+      To_Free := Iter.Pos;
+      Next_Val := REF(Iter.Robj, To_Free).Next;
+      if (Iter.Prev /= NULL_REF) then
+         -- Not deleting the first item, modify the prev's next ref.
+         REF(Iter.Robj, Iter.Prev).Next := Next_Val;
+      else
+         -- Deleting the first item, change the head.
+         Iter.Robj.Head := Next_Val;
+         if (Next_Val = NULL_REF) then
+            -- Deleting the only item.
+            Iter.Robj.Tail := NULL_REF;
+         end if;
+      end if;
+      Iter.Robj.Count := Iter.Robj.Count - 1;
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      if (Next_Val = NULL_REF) then
+         -- If we delete the last value, we invalidate the iterator by not
+         -- updating it.
+         Iter.Robj.Tail := Iter.Prev;
+         Iter.Pos := NULL_REF;
+      else
+         Iter.Update := Iter.Robj.Update;
+         Iter.Pos := Next_Val;
+         Is_End := Not_Past_End;
+      end if;
+
+      if (Iter.Robj.Cb /= null) then
+         Deleted(Iter.Robj.Cb,
+                 Iter.Robj.all,
+                 REF(Iter.Robj, To_Free).Val);
+      end if;
+
+      Free_Node(Iter.Robj.all, To_Free);
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   function Is_Same (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      if (Iter1.Robj /= Iter2.Robj) then
+         raise Iterator_Mismatch;
+      end if;
+
+      return (Iter1.Pos = Iter2.Pos);
+   end Is_Same;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Iterator) return Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return REF(Iter.Robj, Iter.Pos).Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   procedure Get_Incr (Iter   : in out Iterator;
+                       Val    : out Contained_Type;
+                       Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      Val := REF(Iter.Robj, Iter.Pos).Val;
+      Next(Iter, Is_End);
+   end Get_Incr;
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter1, Iter2 : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter1);
+      Check_Iterator(Iter2);
+
+      return (REF(Iter1.Robj, Iter1.Pos).Val = REF(Iter2.Robj, Iter2.Pos).Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Iter : in Iterator; Val : in Contained_Type) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (REF(Iter.Robj, Iter.Pos).Val = Val);
+   end "=";
+
+
+   ------------------------------------------------------------------------
+   function "=" (Val : in Contained_Type; Iter : in Iterator) return Boolean is
+   begin
+      Check_Iterator(Iter);
+
+      return (Val = REF(Iter.Robj, Iter.Pos).Val);
+   end "=";
+
+end Asgc.List.CTYPEMANAGED;

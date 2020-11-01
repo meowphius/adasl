@@ -1,0 +1,21 @@
+Things to do to the ASL packages (in no particular order).
+
+* Add a dictionary tree.
+
+* Add stuff to tree iterators to support different type of tree traversals
+  (prefix, postfix, breadth-first).
+
+* Make heaps quickly searchable.  Probably should make it optional.
+
+* Change the sed scripts to m4 or something a little better suited for
+  the purpose.
+
+* Add some more example programs.
+
+* Add some dictionary stuff.
+
+* Write better documentation.
+
+* Get some mathematical packages.
+
+* Write a graphics framework.

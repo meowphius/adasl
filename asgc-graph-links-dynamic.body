@@ -1,0 +1,452 @@
+-- The Ada Structured Library - A set of container classes and general
+--   tools for use with Ada95.
+-- Copyright (C) 1998-1999  Corey Minyard (minyard@acm.org)
+--
+-- This library is free software; you can redistribute it and/or modify it
+-- under the terms of the GNU General Public License as published by the
+-- Free Software Foundation; either version 2 of the License, or (at your
+-- option) any later version.
+--
+-- This library is distributed in the hope that it will be useful, but
+-- WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-- General Public License for more details.
+--
+-- You should have received a copy of the GNU General Public License along
+-- with this library; if not, write to the Free Software Foundation, Inc.,
+-- 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+--
+-- As a special exception, if other files instantiate generics from this
+-- unit, or you link this unit with other files to produce an executable,
+-- this unit does not by itself cause the resulting executable to be
+-- covered by the GNU General Public License.  This exception does not
+-- however invalidate any other reasons why the executable file might be
+-- covered by the GNU Public License.
+--
+
+with Ada.Unchecked_Deallocation;
+
+package body Asgc.Graph.Links.DynamicMANAGED is
+
+   procedure Free_Dynamic_Graph_Edge is new Ada.Unchecked_Deallocation
+     (Dynamic_Graph_Edge, Dynamic_Graph_Edge_Ptr);
+
+
+   ------------------------------------------------------------------------
+   -- Check that an iterator is valid.  An iterator is not valid if
+   -- it has not been initialized of if the Link container has been
+   -- modified since the last time the iterator's position was set.
+   procedure Check_Iterator (Iter : in Graph_Link_It'Class) is
+   begin
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+
+      if (Iter.Update /= Iter.Robj.Update) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator;
+
+
+   ------------------------------------------------------------------------
+   -- Check an iterator, but don't require it to have a valid position.
+   -- It still must be initialized properly.
+   procedure Check_Iterator_No_Pos (Iter : in Graph_Link_It'Class) is
+   begin
+      if (Iter.Robj = null) then
+         raise Invalid_Iterator;
+      end if;
+   end Check_Iterator_No_Pos;
+
+   ------------------------------------------------------------------------
+   -- The rest of the methods below are are external definitions whose
+   -- functions are defined in the spec file for this package.
+
+
+   ---------------------------------------------------------------------
+   procedure Free_Graph_Link (Node : in out Graph_Link) is
+      To_Free : Dynamic_Graph_Edge_Ptr;
+   begin
+      while (Node.Edges /= null) loop
+         To_Free := Node.Edges;
+         Node.Edges := To_Free.Next;
+         Free_Dynamic_Graph_Edge(To_Free);
+      end loop;
+   end Free_Graph_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Copied_Graph_Link (Node : in out Graph_Link) is
+      New_Curr : Dynamic_Graph_Edge_Ptr;
+      Curr     : Dynamic_Graph_Edge_Ptr;
+   begin
+      Curr := Node.Edges;
+      if (Curr /= null) then
+         Node.Edges := new Dynamic_Graph_Edge'(Val      => Curr.Val,
+                                               Contents => Curr.Contents,
+                                               Next     => null);
+
+         New_Curr := Node.Edges;
+         Curr := Curr.Next;
+         while (Curr /= null) loop
+            New_Curr.Next := new Dynamic_Graph_Edge'(Val      => Curr.Val,
+                                                     Contents => Curr.Contents,
+                                                     Next     => null);
+            New_Curr := New_Curr.Next;
+            Curr := Curr.Next;
+         end loop;
+      end if;
+   end Copied_Graph_Link;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Node (Iter : in out Graph_Link_It;
+                       Node : in Links.Graph_Link_Class) is
+   begin
+      Iter.Robj := Graph_Link_Class(Node);
+      Iter.Update := Iter.Robj.Update - 1;
+   end Set_Node;
+
+
+   ------------------------------------------------------------------------
+   procedure Add (Node     : in out Graph_Link;
+                  Val      : in Link_Type;
+                  Contents : in Link_Contained_Type) is
+      New_Edge : Dynamic_Graph_Edge_Ptr;
+   begin
+      New_Edge := new Dynamic_Graph_Edge'(Val      => Val,
+                                          Contents => Contents,
+                                          Next     => Node.Edges);
+      Node.Edges := New_Edge;
+      Node.Update := Node.Update + 1;
+      Node.Link_Count := Node.Link_Count + 1;
+   end Add;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete_First (Node : in out Graph_Link) is
+      Curr : Dynamic_Graph_Edge_Ptr;
+   begin
+      Curr := Node.Edges;
+      Node.Edges := Curr.Next;
+      Free_Dynamic_Graph_Edge(Curr);
+      Node.Update := Node.Update + 1;
+      Node.Link_Count := Node.Link_Count - 1;
+   end Delete_First;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete_Val (Node     : in out Graph_Link;
+                         Val      : in Link_Type;
+                         Instance : in Positive := 1) is
+      Curr  : Dynamic_Graph_Edge_Ptr;
+      Prev  : Dynamic_Graph_Edge_Ptr;
+      Count : Positive := 1;
+   begin
+      Curr := Node.Edges;
+      Prev := null;
+      while (Curr /= null) loop
+         if (Curr.Val = Val) then
+            if (Count = Instance) then
+               if (Prev = null) then
+                  Node.Edges := Curr.Next;
+               else
+                  Prev.Next := Curr.Next;
+               end if;
+               Free_Dynamic_Graph_Edge(Curr);
+               Node.Update := Node.Update + 1;
+               Node.Link_Count := Node.Link_Count - 1;
+               return;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+         Prev := Curr;
+         Curr := Curr.Next;
+      end loop;
+
+      raise Item_Not_Found;
+   end Delete_Val;
+
+
+   ------------------------------------------------------------------------
+   function Get_Pos (Node : in Graph_Link;
+                     Pos  : in Positive)
+                     return Link_Type is
+      Curr : Dynamic_Graph_Edge_Ptr;
+   begin
+      Curr := Node.Edges;
+      for I in 2 .. Pos loop
+         Curr := Curr.Next;
+      end loop;
+
+      return Curr.Val;
+   end Get_Pos;
+
+
+   ------------------------------------------------------------------------
+   function Val_Exists (Node     : in Graph_Link;
+                        Val      : in Link_Type;
+                        Instance : in Positive := 1)
+                        return Boolean is
+      Curr  : Dynamic_Graph_Edge_Ptr;
+      Count : Positive := 1;
+   begin
+      Curr := Node.Edges;
+      while (Curr /= null) loop
+         if (Curr.Val = Val) then
+            if (Count = Instance) then
+               return True;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+         Curr := Curr.Next;
+      end loop;
+
+      return False;
+   end Val_Exists;
+
+
+   ------------------------------------------------------------------------
+   function Get_Contents (Iter : in Graph_Link_It)
+                          return Link_Contained_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Curr.Contents;
+   end Get_Contents;
+
+
+   ------------------------------------------------------------------------
+   function Get_Contents (Node     : in Graph_Link;
+                          Val      : in Link_Type;
+                          Instance : in Positive := 1)
+                          return Link_Contained_Type is
+      Curr  : Dynamic_Graph_Edge_Ptr;
+      Count : Positive := 1;
+   begin
+      Curr := Node.Edges;
+      while (Curr /= null) loop
+         if (Curr.Val = Val) then
+            if (Count = Instance) then
+               return Curr.Contents;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+         Curr := Curr.Next;
+      end loop;
+
+      raise Item_Not_Found;
+   end Get_Contents;
+
+
+   ------------------------------------------------------------------------
+   function Get_First_Contents (Node : in Graph_Link)
+                                return Link_Contained_Type is
+   begin
+      return Node.Edges.Contents;
+   end Get_First_Contents;
+
+
+   ------------------------------------------------------------------------
+   procedure Set_Contents (Iter     : in out Graph_Link_It;
+                           Contents : in Link_Contained_Type) is
+   begin
+      Check_Iterator(Iter);
+
+      Iter.Curr.Contents := Contents;
+   end Set_Contents;
+
+
+   ------------------------------------------------------------------------
+   procedure Delete (Iter   : in out Graph_Link_It;
+                     Is_End : out End_Marker) is
+      To_Free  : Dynamic_Graph_Edge_Ptr;
+   begin
+      Check_Iterator(Iter);
+
+      To_Free := Iter.Curr;
+      Iter.Curr := Iter.Curr.Next;
+      if (Iter.Prev = null) then
+         Iter.Robj.Edges := To_Free.Next;
+      else
+         Iter.Prev.Next := To_Free.Next;
+      end if;
+      Free_Dynamic_Graph_Edge(To_Free);
+      Iter.Robj.Update := Iter.Robj.Update + 1;
+      Iter.Robj.Link_Count := Iter.Robj.Link_Count - 1;
+      if (Iter.Curr = null) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Delete;
+
+
+   ------------------------------------------------------------------------
+   procedure First (Iter   : in out Graph_Link_It;
+                    Is_End : out End_Marker) is
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      if (Iter.Robj.Edges = null) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Prev := null;
+         Iter.Curr := Iter.Robj.Edges;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end First;
+
+
+   ------------------------------------------------------------------------
+   procedure Next (Iter   : in out Graph_Link_It;
+                   Is_End : out End_Marker) is
+   begin
+      Check_Iterator(Iter);
+
+      if (Iter.Curr.Next = null) then
+         Is_End := Past_End;
+      else
+         Is_End := Not_Past_End;
+         Iter.Prev := Iter.Curr;
+         Iter.Curr := Iter.Curr.Next;
+      end if;
+   end Next;
+
+
+   ------------------------------------------------------------------------
+   procedure Find (Iter     : in out Graph_Link_It;
+                   Val      : in Link_Type;
+                   Found    : out Boolean;
+                   Instance : in Positive := 1) is
+      Curr  : Dynamic_Graph_Edge_Ptr;
+      Prev  : Dynamic_Graph_Edge_Ptr;
+      Count : Positive := 1;
+   begin
+      Check_Iterator_No_Pos(Iter);
+
+      Curr := Iter.Robj.Edges;
+      Prev := null;
+      while (Curr /= null) loop
+         if (Curr.Val = Val) then
+            if (Count = Instance) then
+               exit;
+            else
+               Count := Count + 1;
+            end if;
+         end if;
+         Prev := Curr;
+         Curr := Curr.Next;
+      end loop;
+
+      if (Curr = null) then
+         Found := False;
+      else
+         Found := True;
+         Iter.Prev := Prev;
+         Iter.Curr := Curr;
+         Iter.Update := Iter.Robj.Update;
+      end if;
+   end Find;
+
+
+   ------------------------------------------------------------------------
+   procedure Find_Again (Iter  : in out Graph_Link_It;
+                         Found : out Boolean) is
+      Orig : Dynamic_Graph_Edge_Ptr;
+      Curr : Dynamic_Graph_Edge_Ptr;
+      Prev : Dynamic_Graph_Edge_Ptr;
+   begin
+      Check_Iterator(Iter);
+
+      Orig := Iter.Curr;
+      Prev := Iter.Curr;
+      Curr := Iter.Curr.Next;
+      while ((Curr /= null)
+             and then (Curr.Val /= Orig.Val))
+      loop
+         Prev := Curr;
+         Curr := Curr.Next;
+      end loop;
+
+      if (Curr = null) then
+         Found := False;
+      else
+         Found := True;
+         Iter.Prev := Prev;
+         Iter.Curr := Curr;
+      end if;
+   end Find_Again;
+
+
+   ------------------------------------------------------------------------
+   function Get_Instance_Number (Iter : in Graph_Link_It)
+                                 return Positive is
+      Curr   : Dynamic_Graph_Edge_Ptr;
+      Retval : Positive := 1;
+   begin
+      Check_Iterator(Iter);
+
+      Curr := Iter.Robj.Edges;
+      while (Curr /= Iter.Curr) loop
+         if (Curr.Val = Iter.Curr.Val) then
+            Retval := Retval + 1;
+         end if;
+         Curr := Curr.Next;
+      end loop;
+
+      return Retval;
+   end Get_Instance_Number;
+
+
+   ------------------------------------------------------------------------
+   function Get_Instance_Number (Node : in Graph_Link;
+                                 Pos  : in Positive)
+                                 return Positive is
+      Curr   : Dynamic_Graph_Edge_Ptr;
+      Ref    : Dynamic_Graph_Edge_Ptr;
+      Retval : Positive := 1;
+   begin
+      if (Pos > Node.Link_Count) then
+         raise Constraint_Error;
+      end if;
+
+      Ref := Node.Edges;
+      for I in 2 .. Pos loop
+         Ref := Ref.Next;
+      end loop;
+
+      Curr := Node.Edges;
+      for I in 1 .. (Pos - 1) loop
+         if (Curr.Val = Ref.Val) then
+            Retval := Retval + 1;
+         end if;
+         Curr := Curr.Next;
+      end loop;
+
+      return Retval;
+   end Get_Instance_Number;
+
+
+   ------------------------------------------------------------------------
+   function Get (Iter : in Graph_Link_It)
+                 return Link_Type is
+   begin
+      Check_Iterator(Iter);
+
+      return Iter.Curr.Val;
+   end Get;
+
+
+   ------------------------------------------------------------------------
+   function Link_Count (Node : in Graph_Link) return Natural is
+   begin
+      return Node.Link_Count;
+   end Link_Count;
+
+end Asgc.Graph.Links.DynamicMANAGED;
